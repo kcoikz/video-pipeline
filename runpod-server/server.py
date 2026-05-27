@@ -1,13 +1,13 @@
 import asyncio
 import copy
-import json
+import struct
 import subprocess
 import time
 from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 app = FastAPI()
 
@@ -16,6 +16,15 @@ JOBS_DIR.mkdir(exist_ok=True)
 
 CHATTERBOX_URL = "http://127.0.0.1:8004"
 COMFY_URL = "http://127.0.0.1:8188"
+
+# Active job tracker — watchdog calls /status to check if pipeline is busy
+_active_jobs: dict = {}
+
+def _job_start(job_id: str):
+    _active_jobs[job_id] = time.time()
+
+def _job_end(job_id: str):
+    _active_jobs.pop(job_id, None)
 
 # FLUX.1 Schnell workflow — 4 steps, 1024x576 (16:9)
 FLUX_WORKFLOW = {
@@ -31,14 +40,20 @@ FLUX_WORKFLOW = {
 }
 
 
-# ── Health ────────────────────────────────────────────────────────
+# ── Health & Status ───────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 
-# ── TTS — proxy to Chatterbox ─────────────────────────────────────
+@app.get("/status")
+async def status():
+    jobs = [{"job_id": k, "running_sec": round(time.time() - v)} for k, v in _active_jobs.items()]
+    return {"pipeline_active": len(jobs) > 0, "active_jobs": jobs}
+
+
+# ── TTS — proxy to Chatterbox (legacy, returns binary) ───────────
 
 @app.post("/tts")
 async def tts(request: Request):
@@ -49,19 +64,8 @@ async def tts(request: Request):
         resp = await client.post(f"{CHATTERBOX_URL}/tts", json=body)
         if resp.status_code != 200:
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
-
-    # Parse WAV header to get duration: data_size / (sample_rate * channels * bits/8)
     wav = resp.content
-    duration_sec = 0.0
-    if len(wav) > 44 and wav[:4] == b"RIFF":
-        import struct
-        sample_rate = struct.unpack_from("<I", wav, 24)[0]
-        channels    = struct.unpack_from("<H", wav, 22)[0]
-        bits        = struct.unpack_from("<H", wav, 34)[0]
-        data_size   = struct.unpack_from("<I", wav, 40)[0]
-        if sample_rate and channels and bits:
-            duration_sec = round(data_size / (sample_rate * channels * (bits // 8)), 3)
-
+    duration_sec = _wav_duration(wav)
     return StreamingResponse(
         iter([wav]),
         media_type="audio/wav",
@@ -72,81 +76,34 @@ async def tts(request: Request):
     )
 
 
-# ── Image generation — FLUX Schnell via ComfyUI ───────────────────
-
-@app.post("/generate-image")
-async def generate_image(request: Request):
-    body = await request.json()
-
-    workflow = copy.deepcopy(FLUX_WORKFLOW)
-    workflow["6"]["inputs"]["text"]         = body.get("prompt", "")
-    workflow["5"]["inputs"]["width"]        = body.get("width", 1024)
-    workflow["5"]["inputs"]["height"]       = body.get("height", 576)
-    workflow["3"]["inputs"]["steps"]        = body.get("steps", 4)
-    workflow["3"]["inputs"]["seed"]         = body.get("seed", int(time.time()) % 2**32)
-
-    async with httpx.AsyncClient(timeout=180) as client:
-        # Submit to ComfyUI queue
-        submit = await client.post(f"{COMFY_URL}/prompt", json={"prompt": workflow})
-        if submit.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"ComfyUI submit failed: {submit.text}")
-        prompt_id = submit.json()["prompt_id"]
-
-        # Poll history until done (max 2 min)
-        for _ in range(120):
-            await asyncio.sleep(1)
-            history = (await client.get(f"{COMFY_URL}/history/{prompt_id}")).json()
-            if prompt_id not in history:
-                continue
-            outputs = history[prompt_id].get("outputs", {})
-            for node_out in outputs.values():
-                images = node_out.get("images", [])
-                if not images:
-                    continue
-                fname = images[0]["filename"]
-                img = await client.get(f"{COMFY_URL}/view", params={"filename": fname, "type": "output"})
-                return StreamingResponse(
-                    iter([img.content]),
-                    media_type="image/png",
-                    headers={"Content-Disposition": f"attachment; filename={fname}"},
-                )
-            raise HTTPException(status_code=500, detail="ComfyUI returned no images")
-
-    raise HTTPException(status_code=504, detail="ComfyUI timed out after 120s")
-
-
-# ── TTS + save (no binary in n8n) ─────────────────────────────────
+# ── TTS + save (pipeline uses this — returns JSON with duration) ──
 
 @app.post("/tts-upload/{job_id}/{folder}")
 async def tts_upload(job_id: str, folder: str, request: Request):
-    import struct
-    body = await request.json()
-    body.setdefault("voice_mode", "predefined")
-    body.setdefault("predefined_voice_id", "Emily.wav")
-    async with httpx.AsyncClient(timeout=600) as client:
-        resp = await client.post(f"{CHATTERBOX_URL}/tts", json=body)
-        if resp.status_code != 200:
-            raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    wav = resp.content
-    dest = JOBS_DIR / job_id / folder
-    dest.mkdir(parents=True, exist_ok=True)
-    (dest / "en_audio.wav").write_bytes(wav)
-    duration_sec = 0.0
-    if len(wav) > 44 and wav[:4] == b"RIFF":
-        sample_rate = struct.unpack_from("<I", wav, 24)[0]
-        channels    = struct.unpack_from("<H", wav, 22)[0]
-        bits        = struct.unpack_from("<H", wav, 34)[0]
-        data_size   = struct.unpack_from("<I", wav, 40)[0]
-        if sample_rate and channels and bits:
-            duration_sec = round(data_size / (sample_rate * channels * (bits // 8)), 3)
-    scene_count = max(1, int(duration_sec / 20))
-    return {"success": True, "duration_sec": duration_sec, "scene_count": scene_count}
+    _job_start(job_id)
+    try:
+        body = await request.json()
+        body.setdefault("voice_mode", "predefined")
+        body.setdefault("predefined_voice_id", "Emily.wav")
+        async with httpx.AsyncClient(timeout=600) as client:
+            resp = await client.post(f"{CHATTERBOX_URL}/tts", json=body)
+            if resp.status_code != 200:
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        wav = resp.content
+        dest = JOBS_DIR / job_id / folder
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "en_audio.wav").write_bytes(wav)
+        duration_sec = _wav_duration(wav)
+        scene_count = max(1, int(duration_sec / 20))
+        return {"success": True, "duration_sec": duration_sec, "scene_count": scene_count}
+    finally:
+        _job_end(job_id)
 
 
-# ── Generate image + save (no binary in n8n) ──────────────────────
+# ── Image generation — FLUX Schnell via ComfyUI (legacy) ─────────
 
-@app.post("/generate-and-save/{job_id}/{folder}/{filename}")
-async def generate_and_save(job_id: str, folder: str, filename: str, request: Request):
+@app.post("/generate-image")
+async def generate_image(request: Request):
     body = await request.json()
     wf = copy.deepcopy(FLUX_WORKFLOW)
     wf["6"]["inputs"]["text"]   = body.get("prompt", "")
@@ -170,12 +127,52 @@ async def generate_and_save(job_id: str, folder: str, filename: str, request: Re
                     continue
                 fname = images[0]["filename"]
                 img = await client.get(f"{COMFY_URL}/view", params={"filename": fname, "type": "output"})
-                dest = JOBS_DIR / job_id / folder
-                dest.mkdir(parents=True, exist_ok=True)
-                (dest / filename).write_bytes(img.content)
-                return {"success": True}
+                return StreamingResponse(
+                    iter([img.content]),
+                    media_type="image/png",
+                    headers={"Content-Disposition": f"attachment; filename={fname}"},
+                )
             raise HTTPException(status_code=500, detail="ComfyUI returned no images")
-    raise HTTPException(status_code=504, detail="ComfyUI timed out")
+    raise HTTPException(status_code=504, detail="ComfyUI timed out after 120s")
+
+
+# ── Generate image + save (pipeline uses this — returns JSON) ─────
+
+@app.post("/generate-and-save/{job_id}/{folder}/{filename}")
+async def generate_and_save(job_id: str, folder: str, filename: str, request: Request):
+    _job_start(job_id)
+    try:
+        body = await request.json()
+        wf = copy.deepcopy(FLUX_WORKFLOW)
+        wf["6"]["inputs"]["text"]   = body.get("prompt", "")
+        wf["5"]["inputs"]["width"]  = body.get("width", 1024)
+        wf["5"]["inputs"]["height"] = body.get("height", 576)
+        wf["3"]["inputs"]["steps"]  = body.get("steps", 4)
+        wf["3"]["inputs"]["seed"]   = body.get("seed", int(time.time()) % 2**32)
+        async with httpx.AsyncClient(timeout=180) as client:
+            submit = await client.post(f"{COMFY_URL}/prompt", json={"prompt": wf})
+            if submit.status_code != 200:
+                raise HTTPException(status_code=500, detail=f"ComfyUI submit failed: {submit.text}")
+            prompt_id = submit.json()["prompt_id"]
+            for _ in range(120):
+                await asyncio.sleep(1)
+                history = (await client.get(f"{COMFY_URL}/history/{prompt_id}")).json()
+                if prompt_id not in history:
+                    continue
+                for node_out in history[prompt_id].get("outputs", {}).values():
+                    images = node_out.get("images", [])
+                    if not images:
+                        continue
+                    fname = images[0]["filename"]
+                    img = await client.get(f"{COMFY_URL}/view", params={"filename": fname, "type": "output"})
+                    dest = JOBS_DIR / job_id / folder
+                    dest.mkdir(parents=True, exist_ok=True)
+                    (dest / filename).write_bytes(img.content)
+                    return {"success": True}
+                raise HTTPException(status_code=500, detail="ComfyUI returned no images")
+        raise HTTPException(status_code=504, detail="ComfyUI timed out")
+    finally:
+        _job_end(job_id)
 
 
 # ── File upload ───────────────────────────────────────────────────
@@ -192,31 +189,27 @@ async def upload_file(job_id: str, folder: str, filename: str, request: Request)
 
 @app.post("/render/{job_id}")
 async def render_video(job_id: str, request: Request):
-    body         = await request.json()
-    video_type   = body.get("type", "short_en")       # "short_en" | "sleep_en"
-    scene_count  = int(body.get("scene_count", 9))
-    scene_dur    = int(body.get("scene_duration", 20))
-
-    folder     = "short" if "short" in video_type else "sleep"
-    job_path   = JOBS_DIR / job_id / folder
-    audio_path = job_path / "en_audio.wav"
-    output_mp4 = JOBS_DIR / job_id / f"{video_type}.mp4"
-    concat_txt = JOBS_DIR / job_id / f"{video_type}_concat.txt"
+    body        = await request.json()
+    video_type  = body.get("type", "short_en")
+    scene_count = int(body.get("scene_count", 9))
+    scene_dur   = int(body.get("scene_duration", 20))
+    folder      = "short" if "short" in video_type else "sleep"
+    job_path    = JOBS_DIR / job_id / folder
+    audio_path  = job_path / "en_audio.wav"
+    output_mp4  = JOBS_DIR / job_id / f"{video_type}.mp4"
+    concat_txt  = JOBS_DIR / job_id / f"{video_type}_concat.txt"
 
     if not audio_path.exists():
         raise HTTPException(status_code=400, detail=f"Audio not found: {audio_path}")
 
-    # Build FFmpeg concat file
     lines = []
     for i in range(scene_count):
         img = job_path / f"scene_{str(i).zfill(3)}.jpg"
         if not img.exists():
-            # Try .png fallback (ComfyUI saves PNG by default)
             img = job_path / f"scene_{str(i).zfill(3)}.png"
         if not img.exists():
             raise HTTPException(status_code=400, detail=f"Missing scene image {i}")
         lines.append(f"file '{img}'\nduration {scene_dur}")
-    # Concat demuxer requires last file repeated without duration
     lines.append(f"file '{img}'")
     concat_txt.write_text("\n".join(lines))
 
@@ -233,11 +226,7 @@ async def render_video(job_id: str, request: Request):
     if result.returncode != 0:
         raise HTTPException(status_code=500, detail=f"FFmpeg failed: {result.stderr[-600:]}")
 
-    return {
-        "render_id": f"{job_id}_{video_type}",
-        "status": "done",
-        "download_url": f"/download/{job_id}/{video_type}",
-    }
+    return {"render_id": f"{job_id}_{video_type}", "status": "done", "download_url": f"/download/{job_id}/{video_type}"}
 
 
 # ── Video download ────────────────────────────────────────────────
@@ -248,3 +237,16 @@ async def download_video(job_id: str, video_type: str):
     if not path.exists():
         raise HTTPException(status_code=404, detail="Video not found")
     return FileResponse(str(path), media_type="video/mp4", filename=f"{job_id}_{video_type}.mp4")
+
+
+# ── Helpers ───────────────────────────────────────────────────────
+
+def _wav_duration(wav: bytes) -> float:
+    if len(wav) > 44 and wav[:4] == b"RIFF":
+        sample_rate = struct.unpack_from("<I", wav, 24)[0]
+        channels    = struct.unpack_from("<H", wav, 22)[0]
+        bits        = struct.unpack_from("<H", wav, 34)[0]
+        data_size   = struct.unpack_from("<I", wav, 40)[0]
+        if sample_rate and channels and bits:
+            return round(data_size / (sample_rate * channels * (bits // 8)), 3)
+    return 0.0
