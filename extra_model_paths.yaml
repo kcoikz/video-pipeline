@@ -1,0 +1,5 @@
+comfyui:
+    base_path: /workspace/models
+    unet: unet/
+    vae: vae/
+    clip: clip/
