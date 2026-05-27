@@ -49,10 +49,26 @@ async def tts(request: Request):
         resp = await client.post(f"{CHATTERBOX_URL}/tts", json=body)
         if resp.status_code != 200:
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
+
+    # Parse WAV header to get duration: data_size / (sample_rate * channels * bits/8)
+    wav = resp.content
+    duration_sec = 0.0
+    if len(wav) > 44 and wav[:4] == b"RIFF":
+        import struct
+        sample_rate = struct.unpack_from("<I", wav, 24)[0]
+        channels    = struct.unpack_from("<H", wav, 22)[0]
+        bits        = struct.unpack_from("<H", wav, 34)[0]
+        data_size   = struct.unpack_from("<I", wav, 40)[0]
+        if sample_rate and channels and bits:
+            duration_sec = round(data_size / (sample_rate * channels * (bits // 8)), 3)
+
     return StreamingResponse(
-        iter([resp.content]),
+        iter([wav]),
         media_type="audio/wav",
-        headers={"Content-Disposition": "attachment; filename=audio.wav"},
+        headers={
+            "Content-Disposition": "attachment; filename=audio.wav",
+            "X-Audio-Duration": str(duration_sec),
+        },
     )
 
 
@@ -97,6 +113,69 @@ async def generate_image(request: Request):
             raise HTTPException(status_code=500, detail="ComfyUI returned no images")
 
     raise HTTPException(status_code=504, detail="ComfyUI timed out after 120s")
+
+
+# ── TTS + save (no binary in n8n) ─────────────────────────────────
+
+@app.post("/tts-upload/{job_id}/{folder}")
+async def tts_upload(job_id: str, folder: str, request: Request):
+    import struct
+    body = await request.json()
+    body.setdefault("voice_mode", "predefined")
+    body.setdefault("predefined_voice_id", "Emily.wav")
+    async with httpx.AsyncClient(timeout=600) as client:
+        resp = await client.post(f"{CHATTERBOX_URL}/tts", json=body)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    wav = resp.content
+    dest = JOBS_DIR / job_id / folder
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "en_audio.wav").write_bytes(wav)
+    duration_sec = 0.0
+    if len(wav) > 44 and wav[:4] == b"RIFF":
+        sample_rate = struct.unpack_from("<I", wav, 24)[0]
+        channels    = struct.unpack_from("<H", wav, 22)[0]
+        bits        = struct.unpack_from("<H", wav, 34)[0]
+        data_size   = struct.unpack_from("<I", wav, 40)[0]
+        if sample_rate and channels and bits:
+            duration_sec = round(data_size / (sample_rate * channels * (bits // 8)), 3)
+    scene_count = max(1, int(duration_sec / 20))
+    return {"success": True, "duration_sec": duration_sec, "scene_count": scene_count}
+
+
+# ── Generate image + save (no binary in n8n) ──────────────────────
+
+@app.post("/generate-and-save/{job_id}/{folder}/{filename}")
+async def generate_and_save(job_id: str, folder: str, filename: str, request: Request):
+    body = await request.json()
+    wf = copy.deepcopy(FLUX_WORKFLOW)
+    wf["6"]["inputs"]["text"]   = body.get("prompt", "")
+    wf["5"]["inputs"]["width"]  = body.get("width", 1024)
+    wf["5"]["inputs"]["height"] = body.get("height", 576)
+    wf["3"]["inputs"]["steps"]  = body.get("steps", 4)
+    wf["3"]["inputs"]["seed"]   = body.get("seed", int(time.time()) % 2**32)
+    async with httpx.AsyncClient(timeout=180) as client:
+        submit = await client.post(f"{COMFY_URL}/prompt", json={"prompt": wf})
+        if submit.status_code != 200:
+            raise HTTPException(status_code=500, detail=f"ComfyUI submit failed: {submit.text}")
+        prompt_id = submit.json()["prompt_id"]
+        for _ in range(120):
+            await asyncio.sleep(1)
+            history = (await client.get(f"{COMFY_URL}/history/{prompt_id}")).json()
+            if prompt_id not in history:
+                continue
+            for node_out in history[prompt_id].get("outputs", {}).values():
+                images = node_out.get("images", [])
+                if not images:
+                    continue
+                fname = images[0]["filename"]
+                img = await client.get(f"{COMFY_URL}/view", params={"filename": fname, "type": "output"})
+                dest = JOBS_DIR / job_id / folder
+                dest.mkdir(parents=True, exist_ok=True)
+                (dest / filename).write_bytes(img.content)
+                return {"success": True}
+            raise HTTPException(status_code=500, detail="ComfyUI returned no images")
+    raise HTTPException(status_code=504, detail="ComfyUI timed out")
 
 
 # ── File upload ───────────────────────────────────────────────────
