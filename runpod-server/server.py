@@ -226,7 +226,13 @@ async def render_video(job_id: str, request: Request):
     if result.returncode != 0:
         raise HTTPException(status_code=500, detail=f"FFmpeg failed: {result.stderr[-600:]}")
 
-    return {"render_id": f"{job_id}_{video_type}", "status": "done", "download_url": f"/download/{job_id}/{video_type}"}
+    # Copy to Network Volume so video survives pod termination
+    import shutil
+    volume_out = Path("/workspace/output") / job_id
+    volume_out.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(str(output_mp4), str(volume_out / f"{video_type}.mp4"))
+
+    return {"render_id": f"{job_id}_{video_type}", "status": "done", "download_url": f"/download/{job_id}/{video_type}", "volume_path": f"/workspace/output/{job_id}/{video_type}.mp4"}
 
 
 # ── Video download ────────────────────────────────────────────────
