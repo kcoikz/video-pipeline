@@ -4,20 +4,25 @@ on:
   workflow_dispatch:
 
 jobs:
-  set-visibility:
+  repush-as-public:
     runs-on: ubuntu-latest
     permissions:
       packages: write
 
     steps:
-      - name: Set container package visibility to public
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull private image, retag, and push as public
         run: |
-          curl -s -X PATCH \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            https://api.github.com/users/kcoikz/packages/container/video-pipeline \
-            -d '{"visibility":"public"}' \
-            | tee /tmp/result.json
-          STATUS=$(cat /tmp/result.json | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('visibility','unknown'))" 2>/dev/null || echo "check output above")
-          echo "Visibility: $STATUS"
+          # Pull existing image (GITHUB_TOKEN can pull from private package linked to this repo)
+          docker pull ghcr.io/kcoikz/video-pipeline:latest
+          # Retag to video-pipeline-pub (new name → public by default since repo is now public)
+          docker tag ghcr.io/kcoikz/video-pipeline:latest ghcr.io/kcoikz/video-pipeline-pub:latest
+          # Push new public tag
+          docker push ghcr.io/kcoikz/video-pipeline-pub:latest
+          echo "Done — image available at ghcr.io/kcoikz/video-pipeline-pub:latest"
