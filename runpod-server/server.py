@@ -25,6 +25,9 @@ _service_pids: dict[str, int] = {}
 # Active job tracker — watchdog calls /status to check if pipeline is busy
 _active_jobs: dict = {}
 
+# Background TTS tasks: "{job_id}/{folder}" -> {"status": "processing"/"done"/"error", ...}
+_tts_tasks: dict[str, dict] = {}
+
 def _job_start(job_id: str):
     _active_jobs[job_id] = time.time()
 
@@ -123,28 +126,82 @@ async def tts(request: Request):
     )
 
 
-# ── TTS + save (pipeline uses this — returns JSON with duration) ──
+# ── TTS + save (pipeline uses this — async: start then poll) ──────
 
-@app.post("/tts-upload/{job_id}/{folder}")
-async def tts_upload(job_id: str, folder: str, request: Request):
-    _job_start(job_id)
+async def _run_tts_background(job_id: str, folder: str, body: dict, task_key: str):
+    """Background coroutine: calls Chatterbox, saves WAV, updates _tts_tasks."""
     try:
-        body = await request.json()
         body.setdefault("voice_mode", "predefined")
         body.setdefault("predefined_voice_id", "Emily.wav")
-        async with httpx.AsyncClient(timeout=600) as client:
+        async with httpx.AsyncClient(timeout=1800) as client:
             resp = await client.post(f"{CHATTERBOX_URL}/tts", json=body)
             if resp.status_code != 200:
-                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+                _tts_tasks[task_key] = {"status": "error", "error": resp.text}
+                return
         wav = resp.content
         dest = JOBS_DIR / job_id / folder
         dest.mkdir(parents=True, exist_ok=True)
         (dest / "en_audio.wav").write_bytes(wav)
         duration_sec = _wav_duration(wav)
         scene_count = max(1, int(duration_sec / 20))
-        return {"success": True, "duration_sec": duration_sec, "scene_count": scene_count}
+        _tts_tasks[task_key] = {
+            "status": "done",
+            "success": True,
+            "duration_sec": duration_sec,
+            "scene_count": scene_count,
+        }
+    except Exception as e:
+        _tts_tasks[task_key] = {"status": "error", "error": str(e)}
     finally:
         _job_end(job_id)
+
+
+@app.post("/tts-upload/{job_id}/{folder}")
+async def tts_upload(job_id: str, folder: str, request: Request):
+    """Legacy sync endpoint — kept for compatibility; use /tts-start + /tts-poll instead."""
+    body = await request.json()
+    task_key = f"{job_id}/{folder}"
+    # Reuse async machinery
+    _tts_tasks[task_key] = {"status": "processing"}
+    _job_start(job_id)
+    asyncio.create_task(_run_tts_background(job_id, folder, body, task_key))
+    # Wait up to 90 s (safe under 120s Cloudflare limit) then 503 if not done
+    for _ in range(18):
+        await asyncio.sleep(5)
+        t = _tts_tasks.get(task_key, {})
+        if t.get("status") == "done":
+            return {k: v for k, v in t.items() if k != "status"}
+        if t.get("status") == "error":
+            raise HTTPException(status_code=500, detail=t.get("error", "TTS failed"))
+    raise HTTPException(status_code=503, detail="TTS still processing — use /tts-poll")
+
+
+@app.post("/tts-start/{job_id}/{folder}")
+async def tts_start(job_id: str, folder: str, request: Request):
+    """Start TTS in background. Returns immediately. Poll /tts-poll/{job_id}/{folder}."""
+    body = await request.json()
+    task_key = f"{job_id}/{folder}"
+    if _tts_tasks.get(task_key, {}).get("status") == "processing":
+        return {"status": "already_running", "task_key": task_key}
+    _tts_tasks[task_key] = {"status": "processing"}
+    _job_start(job_id)
+    asyncio.create_task(_run_tts_background(job_id, folder, body, task_key))
+    return {"status": "started", "task_key": task_key}
+
+
+@app.get("/tts-poll/{job_id}/{folder}")
+async def tts_poll(job_id: str, folder: str):
+    """Poll TTS background task. Returns 503 while processing (triggers n8n retryOnFail)."""
+    task_key = f"{job_id}/{folder}"
+    t = _tts_tasks.get(task_key)
+    if t is None:
+        raise HTTPException(status_code=404, detail=f"No TTS task: {task_key}")
+    if t["status"] == "done":
+        return {k: v for k, v in t.items() if k != "status"}
+    if t["status"] == "error":
+        raise HTTPException(status_code=500, detail=t.get("error", "TTS failed"))
+    # Still processing — return 503 so n8n retryOnFail keeps polling
+    raise HTTPException(status_code=503, detail="TTS still processing, retry later")
 
 
 # ── Image generation — FLUX Schnell via ComfyUI (legacy) ─────────
