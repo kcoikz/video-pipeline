@@ -19,8 +19,9 @@ RUN pip install s3tokenizer librosa pydub resemble-perth diffusers safetensors
 # Install the Chatterbox TTS core library (resemble-ai/chatterbox)
 RUN pip install git+https://github.com/resemble-ai/chatterbox
 
-# Reinstall CUDA-enabled PyTorch last so nothing overwrites it
-RUN pip install torch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0 \
+# Install PyTorch >= 2.4 (required by chatterbox/transformers) with CUDA 12.1
+# Must be last so nothing can downgrade it
+RUN pip install torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 \
     --index-url https://download.pytorch.org/whl/cu121
 
 # Gateway server
