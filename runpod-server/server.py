@@ -301,6 +301,14 @@ async def upload_to_drive(job_id: str, request: Request):
     parent_folder_id = body["folder_id"]
     case_name = body.get("case_name", job_id)
 
+    _job_start(job_id)  # keep watchdog from killing pod during long upload
+    try:
+      return await _do_upload_to_drive(job_id, access_token, parent_folder_id, case_name)
+    finally:
+      _job_end(job_id)
+
+
+async def _do_upload_to_drive(job_id: str, access_token: str, parent_folder_id: str, case_name: str):
     # Create subfolder for this job
     async with httpx.AsyncClient(timeout=60) as client:
         folder_resp = await client.post(
