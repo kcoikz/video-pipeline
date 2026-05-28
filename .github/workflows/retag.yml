@@ -1,0 +1,30 @@
+name: Retag latest as versioned
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to push (e.g. v17)'
+        required: true
+        default: 'v17'
+
+jobs:
+  retag:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Retag latest as versioned
+        run: |
+          docker pull ghcr.io/kcoikz/video-pipeline-pub:latest
+          docker tag ghcr.io/kcoikz/video-pipeline-pub:latest ghcr.io/kcoikz/video-pipeline-pub:${{ github.event.inputs.tag }}
+          docker push ghcr.io/kcoikz/video-pipeline-pub:${{ github.event.inputs.tag }}
+          echo "Done — ghcr.io/kcoikz/video-pipeline-pub:${{ github.event.inputs.tag }} pushed"
