@@ -1,5 +1,7 @@
 import asyncio
 import copy
+import os
+import signal
 import struct
 import subprocess
 import time
@@ -16,6 +18,9 @@ JOBS_DIR.mkdir(exist_ok=True)
 
 CHATTERBOX_URL = "http://127.0.0.1:8004"
 COMFY_URL = "http://127.0.0.1:8188"
+
+# Track PIDs of managed services so we can restart them
+_service_pids: dict[str, int] = {}
 
 # Active job tracker — watchdog calls /status to check if pipeline is busy
 _active_jobs: dict = {}
@@ -51,6 +56,48 @@ async def health():
 async def status():
     jobs = [{"job_id": k, "running_sec": round(time.time() - v)} for k, v in _active_jobs.items()]
     return {"pipeline_active": len(jobs) > 0, "active_jobs": jobs}
+
+
+@app.get("/services-status")
+async def services_status():
+    results = {}
+    for name, url in [("chatterbox", CHATTERBOX_URL), ("comfyui", COMFY_URL)]:
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                r = await client.get(f"{url}/health")
+                results[name] = {"reachable": True, "status_code": r.status_code}
+        except Exception as e:
+            results[name] = {"reachable": False, "error": str(e)}
+    return results
+
+
+@app.post("/restart-tts")
+async def restart_tts():
+    # Kill existing Chatterbox process on port 8004
+    kill_result = subprocess.run(
+        ["bash", "-c", "fuser -k 8004/tcp; sleep 1; echo killed"],
+        capture_output=True, text=True
+    )
+    # Read HF_HOME from env so models load from workspace cache
+    env = {**os.environ, "HF_HOME": "/workspace/.hf_cache"}
+    proc = subprocess.Popen(
+        ["python", "server.py"],
+        cwd="/root/Chatterbox-TTS-Server",
+        env=env,
+        stdout=open("/workspace/logs/chatterbox.log", "a"),
+        stderr=subprocess.STDOUT,
+    )
+    _service_pids["chatterbox"] = proc.pid
+    return {"started": True, "pid": proc.pid, "kill_output": kill_result.stdout.strip()}
+
+
+@app.get("/logs/{service}")
+async def get_logs(service: str, lines: int = 100):
+    log_path = Path(f"/workspace/logs/{service}.log")
+    if not log_path.exists():
+        raise HTTPException(status_code=404, detail=f"Log not found: {log_path}")
+    result = subprocess.run(["tail", f"-{lines}", str(log_path)], capture_output=True, text=True)
+    return {"log": result.stdout, "path": str(log_path)}
 
 
 # ── TTS — proxy to Chatterbox (legacy, returns binary) ───────────
