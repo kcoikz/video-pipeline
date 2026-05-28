@@ -43,6 +43,8 @@ jobs:
         with:
           context: .
           push: true
-          tags: ${{ env.IMAGE }}:latest
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}-pub:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
