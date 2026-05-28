@@ -1,17 +1,17 @@
 #!/bin/bash
 # Launch a video-pipeline pod — tries all regions until one succeeds.
-# Usage: ./launch_pod.sh
+# Usage: RUNPOD_KEY=xxx ./launch_pod.sh
 # Outputs: POD_ID and POD_URL on success
 
 RUNPOD_KEY="${RUNPOD_KEY:?Need to set RUNPOD_KEY env var}"
 IMAGE="ghcr.io/kcoikz/video-pipeline-pub:latest"
 REGISTRY_AUTH="cmpoqe1h500cajr0756c7qngj"
 
-# Region map: volume_id → datacenter label (for logging)
-declare -A VOLUMES=(
-  ["EU-RO-1"]="tifjm0naz9"
-  ["EU-CZ-1"]="idsera2r8h"
-  ["US-TX-3"]="s87itjzpfj"
+# Pairs: "REGION:VOLUME_ID" — avoids declare -A (macOS bash 3.2 compat)
+REGION_VOLUMES=(
+  "EU-RO-1:tifjm0naz9"
+  "EU-CZ-1:idsera2r8h"
+  "US-TX-3:s87itjzpfj"
 )
 
 GPU_TYPES=(
@@ -61,8 +61,9 @@ print(pod['id'] if pod else 'FAIL')
 
 echo "Trying to launch pod across all regions..."
 
-for REGION in "EU-RO-1" "EU-CZ-1" "US-TX-3"; do
-  VOL_ID="${VOLUMES[$REGION]}"
+for RV in "${REGION_VOLUMES[@]}"; do
+  REGION="${RV%%:*}"
+  VOL_ID="${RV##*:}"
   for GPU in "${GPU_TYPES[@]}"; do
     echo "  [$REGION] $GPU ..."
     POD_ID=$(launch "$REGION" "$VOL_ID" "$GPU")
