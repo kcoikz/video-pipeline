@@ -292,6 +292,94 @@ async def download_video(job_id: str, video_type: str):
     return FileResponse(str(path), media_type="video/mp4", filename=f"{job_id}_{video_type}.mp4")
 
 
+# ── Upload videos to Google Drive (chunked resumable) ─────────────
+
+@app.post("/upload-to-drive/{job_id}")
+async def upload_to_drive(job_id: str, request: Request):
+    body = await request.json()
+    access_token = body["access_token"]
+    parent_folder_id = body["folder_id"]
+    case_name = body.get("case_name", job_id)
+
+    # Create subfolder for this job
+    async with httpx.AsyncClient(timeout=60) as client:
+        folder_resp = await client.post(
+            "https://www.googleapis.com/drive/v3/files",
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json={"name": case_name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_folder_id]},
+        )
+        if folder_resp.status_code not in (200, 201):
+            raise HTTPException(status_code=500, detail=f"Folder creation failed: {folder_resp.text}")
+        subfolder_id = folder_resp.json()["id"]
+
+    results = {
+        "folder_id": subfolder_id,
+        "folder_url": f"https://drive.google.com/drive/folders/{subfolder_id}",
+    }
+
+    CHUNK = 10 * 1024 * 1024  # 10 MB chunks
+
+    for video_type in ["short_en", "sleep_en"]:
+        file_path = JOBS_DIR / job_id / f"{video_type}.mp4"
+        if not file_path.exists():
+            results[video_type] = {"error": "not found"}
+            continue
+
+        file_size = file_path.stat().st_size
+
+        async with httpx.AsyncClient(timeout=3600) as client:
+            # Initiate resumable upload
+            init_resp = await client.post(
+                "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                    "X-Upload-Content-Type": "video/mp4",
+                    "X-Upload-Content-Length": str(file_size),
+                },
+                json={"name": f"{video_type}.mp4", "parents": [subfolder_id]},
+            )
+            if init_resp.status_code != 200:
+                results[video_type] = {"error": f"init failed {init_resp.status_code}: {init_resp.text[:200]}"}
+                continue
+
+            upload_url = init_resp.headers["Location"]
+
+            file_id = None
+            with open(file_path, "rb") as f:
+                offset = 0
+                while offset < file_size:
+                    chunk = f.read(CHUNK)
+                    if not chunk:
+                        break
+                    end = offset + len(chunk) - 1
+                    upload_resp = await client.put(
+                        upload_url,
+                        content=chunk,
+                        headers={
+                            "Content-Length": str(len(chunk)),
+                            "Content-Range": f"bytes {offset}-{end}/{file_size}",
+                        },
+                        timeout=300,
+                    )
+                    if upload_resp.status_code in (200, 201):
+                        file_id = upload_resp.json()["id"]
+                        break
+                    elif upload_resp.status_code == 308:
+                        offset = end + 1
+                    else:
+                        results[video_type] = {"error": f"chunk failed {upload_resp.status_code}"}
+                        break
+
+            if file_id:
+                results[video_type] = {
+                    "file_id": file_id,
+                    "view_url": f"https://drive.google.com/file/d/{file_id}/view",
+                }
+
+    return results
+
+
 # ── Helpers ───────────────────────────────────────────────────────
 
 def _wav_duration(wav: bytes) -> float:
