@@ -28,6 +28,12 @@ _active_jobs: dict = {}
 # Background TTS tasks: "{job_id}/{folder}" -> {"status": "processing"/"done"/"error", ...}
 _tts_tasks: dict[str, dict] = {}
 
+# Background render tasks: "{job_id}/{video_type}" -> {"status": ..., ...}
+_render_tasks: dict[str, dict] = {}
+
+# Background Drive upload tasks: job_id -> {"status": ..., ...}
+_drive_tasks: dict[str, dict] = {}
+
 def _job_start(job_id: str):
     _active_jobs[job_id] = time.time()
 
@@ -289,54 +295,124 @@ async def upload_file(job_id: str, folder: str, filename: str, request: Request)
     return {"success": True}
 
 
-# ── Render — FFmpeg slideshow ─────────────────────────────────────
+# ── Render — FFmpeg slideshow (async: start + poll) ───────────────
 
-@app.post("/render/{job_id}")
-async def render_video(job_id: str, request: Request):
+async def _run_render_background(job_id: str, video_type: str, scene_count: int, scene_dur: int, task_key: str):
+    """Run FFmpeg in a thread so we don't block the event loop."""
+    import shutil
+    folder    = "short" if "short" in video_type else "sleep"
+    job_path  = JOBS_DIR / job_id / folder
+    audio_path = job_path / "en_audio.wav"
+    output_mp4 = JOBS_DIR / job_id / f"{video_type}.mp4"
+    concat_txt = JOBS_DIR / job_id / f"{video_type}_concat.txt"
+
+    try:
+        if not audio_path.exists():
+            _render_tasks[task_key] = {"status": "error", "error": f"Audio not found: {audio_path}"}
+            return
+
+        lines = []
+        last_img = None
+        for i in range(scene_count):
+            img = job_path / f"scene_{str(i).zfill(3)}.jpg"
+            if not img.exists():
+                img = job_path / f"scene_{str(i).zfill(3)}.png"
+            if not img.exists():
+                _render_tasks[task_key] = {"status": "error", "error": f"Missing scene image {i}"}
+                return
+            lines.append(f"file '{img}'\nduration {scene_dur}")
+            last_img = img
+        lines.append(f"file '{last_img}'")
+        concat_txt.write_text("\n".join(lines))
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0", "-i", str(concat_txt),
+            "-i", str(audio_path),
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k",
+            "-shortest",
+            str(output_mp4),
+        ]
+        # Run blocking FFmpeg in thread pool so event loop stays free
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, lambda: subprocess.run(cmd, capture_output=True, text=True)
+        )
+        if result.returncode != 0:
+            _render_tasks[task_key] = {"status": "error", "error": f"FFmpeg failed: {result.stderr[-600:]}"}
+            return
+
+        volume_out = Path("/workspace/output") / job_id
+        volume_out.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(output_mp4), str(volume_out / f"{video_type}.mp4"))
+
+        _render_tasks[task_key] = {
+            "status": "done",
+            "render_id": f"{job_id}_{video_type}",
+            "download_url": f"/download/{job_id}/{video_type}",
+            "volume_path": f"/workspace/output/{job_id}/{video_type}.mp4",
+        }
+    except Exception as e:
+        _render_tasks[task_key] = {"status": "error", "error": str(e)}
+    finally:
+        _job_end(job_id)
+
+
+@app.post("/render-start/{job_id}")
+async def render_start(job_id: str, request: Request):
+    """Start render in background. Poll /render-poll/{job_id}/{video_type}."""
     body        = await request.json()
     video_type  = body.get("type", "short_en")
     scene_count = int(body.get("scene_count", 9))
     scene_dur   = int(body.get("scene_duration", 20))
-    folder      = "short" if "short" in video_type else "sleep"
-    job_path    = JOBS_DIR / job_id / folder
-    audio_path  = job_path / "en_audio.wav"
-    output_mp4  = JOBS_DIR / job_id / f"{video_type}.mp4"
-    concat_txt  = JOBS_DIR / job_id / f"{video_type}_concat.txt"
+    task_key    = f"{job_id}/{video_type}"
 
-    if not audio_path.exists():
-        raise HTTPException(status_code=400, detail=f"Audio not found: {audio_path}")
+    if _render_tasks.get(task_key, {}).get("status") == "processing":
+        return {"status": "already_running", "task_key": task_key}
 
-    lines = []
-    for i in range(scene_count):
-        img = job_path / f"scene_{str(i).zfill(3)}.jpg"
-        if not img.exists():
-            img = job_path / f"scene_{str(i).zfill(3)}.png"
-        if not img.exists():
-            raise HTTPException(status_code=400, detail=f"Missing scene image {i}")
-        lines.append(f"file '{img}'\nduration {scene_dur}")
-    lines.append(f"file '{img}'")
-    concat_txt.write_text("\n".join(lines))
+    _render_tasks[task_key] = {"status": "processing"}
+    _job_start(job_id)
+    asyncio.create_task(_run_render_background(job_id, video_type, scene_count, scene_dur, task_key))
+    return {"status": "started", "task_key": task_key}
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "concat", "-safe", "0", "-i", str(concat_txt),
-        "-i", str(audio_path),
-        "-c:v", "libx264", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k",
-        "-shortest",
-        str(output_mp4),
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise HTTPException(status_code=500, detail=f"FFmpeg failed: {result.stderr[-600:]}")
 
-    # Copy to Network Volume so video survives pod termination
-    import shutil
-    volume_out = Path("/workspace/output") / job_id
-    volume_out.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(str(output_mp4), str(volume_out / f"{video_type}.mp4"))
+@app.get("/render-poll/{job_id}/{video_type}")
+async def render_poll(job_id: str, video_type: str):
+    """Poll render status. 503 while processing (triggers n8n retryOnFail), 200 when done."""
+    task_key = f"{job_id}/{video_type}"
+    t = _render_tasks.get(task_key)
+    if t is None:
+        raise HTTPException(status_code=404, detail=f"No render task: {task_key}")
+    if t["status"] == "done":
+        return {k: v for k, v in t.items() if k != "status"}
+    if t["status"] == "error":
+        raise HTTPException(status_code=500, detail=t.get("error", "Render failed"))
+    raise HTTPException(status_code=503, detail="Render still processing, retry later")
 
-    return {"render_id": f"{job_id}_{video_type}", "status": "done", "download_url": f"/download/{job_id}/{video_type}", "volume_path": f"/workspace/output/{job_id}/{video_type}.mp4"}
+
+@app.post("/render/{job_id}")
+async def render_video(job_id: str, request: Request):
+    """Legacy sync endpoint — kept for compat. Use /render-start + /render-poll instead."""
+    body       = await request.json()
+    video_type = body.get("type", "short_en")
+    task_key   = f"{job_id}/{video_type}"
+    _render_tasks[task_key] = {"status": "processing"}
+    _job_start(job_id)
+    asyncio.create_task(_run_render_background(
+        job_id, video_type,
+        int(body.get("scene_count", 9)),
+        int(body.get("scene_duration", 20)),
+        task_key
+    ))
+    for _ in range(18):  # wait up to 90s
+        await asyncio.sleep(5)
+        t = _render_tasks.get(task_key, {})
+        if t.get("status") == "done":
+            return {k: v for k, v in t.items() if k != "status"}
+        if t.get("status") == "error":
+            raise HTTPException(status_code=500, detail=t.get("error", "Render failed"))
+    raise HTTPException(status_code=503, detail="Render still processing — use /render-poll")
 
 
 # ── Video download ────────────────────────────────────────────────
@@ -349,20 +425,62 @@ async def download_video(job_id: str, video_type: str):
     return FileResponse(str(path), media_type="video/mp4", filename=f"{job_id}_{video_type}.mp4")
 
 
-# ── Upload videos to Google Drive (chunked resumable) ─────────────
+# ── Upload videos to Google Drive (async: start + poll) ───────────
+
+async def _run_drive_background(job_id: str, access_token: str, parent_folder_id: str, case_name: str):
+    try:
+        result = await _do_upload_to_drive(job_id, access_token, parent_folder_id, case_name)
+        _drive_tasks[job_id] = {"status": "done", **result}
+    except Exception as e:
+        _drive_tasks[job_id] = {"status": "error", "error": str(e)}
+    finally:
+        _job_end(job_id)
+
+
+@app.post("/drive-start/{job_id}")
+async def drive_start(job_id: str, request: Request):
+    """Start Drive upload in background. Poll /drive-poll/{job_id}."""
+    body = await request.json()
+    if _drive_tasks.get(job_id, {}).get("status") == "processing":
+        return {"status": "already_running"}
+    _drive_tasks[job_id] = {"status": "processing"}
+    _job_start(job_id)
+    asyncio.create_task(_run_drive_background(
+        job_id, body["access_token"], body["folder_id"], body.get("case_name", job_id)
+    ))
+    return {"status": "started"}
+
+
+@app.get("/drive-poll/{job_id}")
+async def drive_poll(job_id: str):
+    """Poll Drive upload. 503 while uploading, 200 when done."""
+    t = _drive_tasks.get(job_id)
+    if t is None:
+        raise HTTPException(status_code=404, detail=f"No drive task: {job_id}")
+    if t["status"] == "done":
+        return {k: v for k, v in t.items() if k != "status"}
+    if t["status"] == "error":
+        raise HTTPException(status_code=500, detail=t.get("error", "Upload failed"))
+    raise HTTPException(status_code=503, detail="Upload still processing, retry later")
+
 
 @app.post("/upload-to-drive/{job_id}")
 async def upload_to_drive(job_id: str, request: Request):
+    """Legacy sync endpoint — use /drive-start + /drive-poll instead."""
     body = await request.json()
-    access_token = body["access_token"]
-    parent_folder_id = body["folder_id"]
-    case_name = body.get("case_name", job_id)
-
-    _job_start(job_id)  # keep watchdog from killing pod during long upload
-    try:
-      return await _do_upload_to_drive(job_id, access_token, parent_folder_id, case_name)
-    finally:
-      _job_end(job_id)
+    _drive_tasks[job_id] = {"status": "processing"}
+    _job_start(job_id)
+    asyncio.create_task(_run_drive_background(
+        job_id, body["access_token"], body["folder_id"], body.get("case_name", job_id)
+    ))
+    for _ in range(18):  # wait up to 90s
+        await asyncio.sleep(5)
+        t = _drive_tasks.get(job_id, {})
+        if t.get("status") == "done":
+            return {k: v for k, v in t.items() if k != "status"}
+        if t.get("status") == "error":
+            raise HTTPException(status_code=500, detail=t.get("error", "Upload failed"))
+    raise HTTPException(status_code=503, detail="Upload still processing — use /drive-poll")
 
 
 async def _do_upload_to_drive(job_id: str, access_token: str, parent_folder_id: str, case_name: str):
