@@ -3,24 +3,37 @@
 export HF_HOME=/workspace/.hf_cache
 mkdir -p /workspace/.hf_cache /workspace/models/unet /workspace/models/vae /workspace/models/clip /workspace/output /workspace/logs
 
+# ── Pull latest code into /workspace/code ─────────────────────────
+CODE_DIR=/workspace/code
+if [ ! -d "$CODE_DIR/.git" ]; then
+    echo "=== Cloning repo to $CODE_DIR ==="
+    rm -rf "$CODE_DIR"
+    git clone https://github.com/kcoikz/video-pipeline.git "$CODE_DIR"
+fi
+cd "$CODE_DIR" && git pull origin main 2>&1 | tail -3
+
+# ── Check FLUX models ─────────────────────────────────────────────
 echo "=== Checking FLUX models ==="
 if [ ! -f "/workspace/models/unet/flux1-schnell.safetensors" ]; then
     echo "=== Models not found, downloading... ==="
-    bash /root/runpod-server/install_models.sh
+    bash "$CODE_DIR/runpod-server/install_models.sh"
 fi
 
+# ── Start Chatterbox (port 8004) ──────────────────────────────────
 echo "=== Starting Chatterbox TTS Server (port 8004) ==="
 cd /root/Chatterbox-TTS-Server
 python server.py > /workspace/logs/chatterbox.log 2>&1 &
 CHATTERBOX_PID=$!
 echo "Chatterbox PID=$CHATTERBOX_PID"
 
+# ── Start ComfyUI (port 8188) ─────────────────────────────────────
 echo "=== Starting ComfyUI (port 8188) ==="
 cd /root/ComfyUI
 python main.py --listen 127.0.0.1 --port 8188 > /workspace/logs/comfyui.log 2>&1 &
 COMFYUI_PID=$!
 echo "ComfyUI PID=$COMFYUI_PID"
 
+# ── Wait for Chatterbox to become ready (up to 15 min) ────────────
 echo "=== Waiting for Chatterbox to become ready (up to 15 min) ==="
 READY=0
 for i in $(seq 1 180); do
@@ -44,6 +57,15 @@ if [ "$READY" = "0" ]; then
     echo "WARNING: Chatterbox did not become ready — gateway will start anyway, TTS calls will fail until Chatterbox recovers"
 fi
 
-echo "=== Starting gateway (port 5002) ==="
-cd /root/runpod-server
-exec uvicorn server:app --host 0.0.0.0 --port 5002
+# ── Run uvicorn in loop, pulling fresh code each restart ──────────
+echo "=== Starting gateway (port 5002) with auto-update loop ==="
+while true; do
+    cd "$CODE_DIR"
+    echo "=== $(date): git pull ==="
+    git pull origin main 2>&1 | tail -3
+    cd "$CODE_DIR/runpod-server"
+    echo "=== $(date): starting uvicorn ==="
+    uvicorn server:app --host 0.0.0.0 --port 5002
+    echo "=== $(date): uvicorn exited, restarting in 2s ==="
+    sleep 2
+done

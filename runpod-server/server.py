@@ -100,6 +100,17 @@ async def restart_tts():
     return {"started": True, "pid": proc.pid, "kill_output": kill_result.stdout.strip()}
 
 
+@app.post("/restart-server")
+async def restart_server():
+    """Triggers uvicorn restart so start.sh's loop pulls fresh code from git.
+    Call this after pushing new code — no Docker rebuild or pod recreation needed."""
+    async def _exit_soon():
+        await asyncio.sleep(1)
+        os._exit(0)
+    asyncio.create_task(_exit_soon())
+    return {"status": "restarting", "note": "start.sh will git pull and restart uvicorn"}
+
+
 @app.get("/logs/{service}")
 async def get_logs(service: str, lines: int = 100):
     log_path = Path(f"/workspace/logs/{service}.log")
