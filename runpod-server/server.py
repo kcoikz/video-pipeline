@@ -316,18 +316,60 @@ async def generate_and_save(job_id: str, folder: str, filename: str, request: Re
 
 # ── Batch image generation (async: start + poll, bounded concurrency) ─
 
+# v31 STEP 4: img2img style anchoring. When key_art.png exists for the job, we
+# build a workflow that VAE-encodes the key-art and feeds it as the latent
+# starting point to KSampler with denoise<1.0. The image content is overwritten
+# by the text prompt but the VISUAL STYLE (palette, lighting, texture, era) is
+# preserved across all frames — solves "different artistic styles between frames".
+#
+# Schnell is distilled so denoise tuning is tricky: too high (>0.9) → no style
+# preservation; too low (<0.7) → content stays too close to key_art. 0.85 is
+# the empirical sweet spot at 6 steps.
+IMG2IMG_STEPS    = 6
+IMG2IMG_DENOISE  = 0.85
+COMFY_INPUT_DIR  = Path("/root/ComfyUI/input")
+
+
+def _build_img2img_workflow(prompt: str, width: int, height: int,
+                              steps: int, seed: int, keyart_ref: str) -> dict:
+    """FLUX img2img workflow conditioned on a key-art reference image.
+    keyart_ref is the FILENAME (not path) inside ComfyUI's input directory."""
+    return {
+        "4":  {"class_type": "UNETLoader",      "inputs": {"unet_name": "flux1-schnell.safetensors", "weight_dtype": "fp8_e4m3fn"}},
+        "10": {"class_type": "VAELoader",        "inputs": {"vae_name": "ae.safetensors"}},
+        "11": {"class_type": "DualCLIPLoader",   "inputs": {"clip_name1": "clip_l.safetensors", "clip_name2": "t5xxl_fp8_e4m3fn.safetensors", "type": "flux", "device": "default"}},
+        "20": {"class_type": "LoadImage",        "inputs": {"image": keyart_ref}},
+        "22": {"class_type": "ImageScale",       "inputs": {"image": ["20", 0], "upscale_method": "lanczos", "width": width, "height": height, "crop": "center"}},
+        "21": {"class_type": "VAEEncode",        "inputs": {"pixels": ["22", 0], "vae": ["10", 0]}},
+        "6":  {"class_type": "CLIPTextEncode",   "inputs": {"text": prompt, "clip": ["11", 0]}},
+        "7":  {"class_type": "CLIPTextEncode",   "inputs": {"text": "", "clip": ["11", 0]}},
+        "3":  {"class_type": "KSampler",         "inputs": {"model": ["4", 0], "positive": ["6", 0], "negative": ["7", 0], "latent_image": ["21", 0], "seed": seed, "steps": steps, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple", "denoise": IMG2IMG_DENOISE}},
+        "8":  {"class_type": "VAEDecode",        "inputs": {"samples": ["3", 0], "vae": ["10", 0]}},
+        "9":  {"class_type": "SaveImage",        "inputs": {"images": ["8", 0], "filename_prefix": "gen"}},
+    }
+
+
 async def _gen_one_image(client: httpx.AsyncClient, job_id: str, folder: str,
                           filename: str, prompt: str, width: int, height: int,
-                          steps: int, task_key: str) -> None:
+                          steps: int, task_key: str,
+                          keyart_ref: str | None = None) -> None:
     """Generate ONE image via ComfyUI and save to disk. Records any error
-    into the batch task's errors list (never raises)."""
+    into the batch task's errors list (never raises).
+
+    v31 Step 4: if keyart_ref is set (filename inside ComfyUI's input dir),
+    builds an img2img workflow conditioned on that reference image. Otherwise
+    falls back to plain text-to-image with FLUX_WORKFLOW."""
     try:
-        wf = copy.deepcopy(FLUX_WORKFLOW)
-        wf["6"]["inputs"]["text"]   = prompt
-        wf["5"]["inputs"]["width"]  = width
-        wf["5"]["inputs"]["height"] = height
-        wf["3"]["inputs"]["steps"]  = steps
-        wf["3"]["inputs"]["seed"]   = int(time.time() * 1000) % 2**32
+        seed = int(time.time() * 1000) % 2**32
+        if keyart_ref:
+            wf = _build_img2img_workflow(prompt, width, height, IMG2IMG_STEPS, seed, keyart_ref)
+        else:
+            wf = copy.deepcopy(FLUX_WORKFLOW)
+            wf["6"]["inputs"]["text"]   = prompt
+            wf["5"]["inputs"]["width"]  = width
+            wf["5"]["inputs"]["height"] = height
+            wf["3"]["inputs"]["steps"]  = steps
+            wf["3"]["inputs"]["seed"]   = seed
         submit = await client.post(f"{COMFY_URL}/prompt", json={"prompt": wf})
         if submit.status_code != 200:
             _image_batch_tasks[task_key]["errors"].append(
@@ -371,8 +413,29 @@ async def _gen_one_image(client: httpx.AsyncClient, job_id: str, folder: str,
 async def _run_image_batch_background(job_id: str, folder: str, prompts: list,
                                        width: int, height: int, steps: int,
                                        task_key: str) -> None:
-    """Generate all prompts with bounded concurrency. Updates _image_batch_tasks."""
+    """Generate all prompts with bounded concurrency. Updates _image_batch_tasks.
+
+    v31 Step 4: if /workspace/key_art/{job_id}.png exists, copies it ONCE into
+    ComfyUI's input directory and switches every generation to img2img mode
+    using it as the style anchor."""
     semaphore = asyncio.Semaphore(IMAGE_BATCH_CONCURRENCY)
+
+    # v31 Step 4: prepare key-art reference (once per batch).
+    keyart_ref: str | None = None
+    keyart_src = _key_art_volume_path(job_id)
+    if keyart_src.exists() and keyart_src.stat().st_size > 0:
+        try:
+            COMFY_INPUT_DIR.mkdir(parents=True, exist_ok=True)
+            keyart_ref = f"keyart_{job_id}.png"
+            ref_path = COMFY_INPUT_DIR / keyart_ref
+            if not ref_path.exists():
+                ref_path.write_bytes(keyart_src.read_bytes())
+        except Exception as e:
+            # If copy fails, fall back to text-to-image — log but don't fail batch
+            _image_batch_tasks[task_key].setdefault("warnings", []).append(
+                {"stage": "keyart_copy", "error": str(e)[:200]}
+            )
+            keyart_ref = None
 
     async def gen_one(item):
         async with semaphore:
@@ -381,12 +444,14 @@ async def _run_image_batch_background(job_id: str, folder: str, prompts: list,
                     client, job_id, folder,
                     item["filename"], item["prompt"],
                     width, height, steps, task_key,
+                    keyart_ref=keyart_ref,
                 )
         _image_batch_tasks[task_key]["done"] += 1
 
     try:
         await asyncio.gather(*[gen_one(item) for item in prompts])
         _image_batch_tasks[task_key]["status"] = "done"
+        _image_batch_tasks[task_key]["mode"] = "img2img" if keyart_ref else "txt2img"
     except Exception as e:
         _image_batch_tasks[task_key]["status"] = "error"
         _image_batch_tasks[task_key]["error"] = str(e)
@@ -613,49 +678,50 @@ async def upload_file(job_id: str, folder: str, filename: str, request: Request)
 # ── Render — FFmpeg slideshow (async: start + poll) ───────────────
 
 async def _run_render_background(job_id: str, video_type: str, scene_count: int, scene_dur: int, task_key: str):
-    """Run FFmpeg in a thread so we don't block the event loop."""
+    """Run the cinematic composer (compose.py) in a thread so we don't block the event loop.
+
+    v31 Step 6: delegates to compose.py which builds a complex ffmpeg filter graph
+    (zoompan + xfade + lut3d + film grain overlay + vignette + audio fades) instead
+    of the old concat-demuxer slideshow.
+    """
     import shutil
     folder    = "short" if "short" in video_type else "sleep"
     job_path  = JOBS_DIR / job_id / folder
     audio_path = job_path / "en_audio.wav"
     output_mp4 = JOBS_DIR / job_id / f"{video_type}.mp4"
-    concat_txt = JOBS_DIR / job_id / f"{video_type}_concat.txt"
+
+    # Locate compose.py — it lives next to server.py on the pod.
+    compose_script = Path(__file__).resolve().parent / "compose.py"
+    if not compose_script.exists():
+        # Fallback to the conventional workspace path.
+        compose_script = Path("/workspace/code/runpod-server/compose.py")
 
     try:
         if not audio_path.exists():
             _render_tasks[task_key] = {"status": "error", "error": f"Audio not found: {audio_path}"}
             return
-
-        lines = []
-        last_img = None
-        for i in range(scene_count):
-            img = job_path / f"scene_{str(i).zfill(3)}.jpg"
-            if not img.exists():
-                img = job_path / f"scene_{str(i).zfill(3)}.png"
-            if not img.exists():
-                _render_tasks[task_key] = {"status": "error", "error": f"Missing scene image {i}"}
-                return
-            lines.append(f"file '{img}'\nduration {scene_dur}")
-            last_img = img
-        lines.append(f"file '{last_img}'")
-        concat_txt.write_text("\n".join(lines))
+        if not compose_script.exists():
+            _render_tasks[task_key] = {"status": "error", "error": f"compose.py not found at {compose_script}"}
+            return
 
         cmd = [
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0", "-i", str(concat_txt),
-            "-i", str(audio_path),
-            "-c:v", "libx264", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k",
-            "-shortest",
-            str(output_mp4),
+            "python3", str(compose_script),
+            "--job-id",      job_id,
+            "--video-type",  video_type,
+            "--scene-count", str(scene_count),
+            "--scene-dur",   str(scene_dur),
+            "--audio",       str(audio_path),
+            "--output",      str(output_mp4),
+            "--jobs-dir",    str(JOBS_DIR),
         ]
-        # Run blocking FFmpeg in thread pool so event loop stays free
+        # Run blocking compose.py in thread pool so event loop stays free
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None, lambda: subprocess.run(cmd, capture_output=True, text=True)
         )
         if result.returncode != 0:
-            _render_tasks[task_key] = {"status": "error", "error": f"FFmpeg failed: {result.stderr[-600:]}"}
+            err_tail = (result.stderr or result.stdout or "")[-1200:]
+            _render_tasks[task_key] = {"status": "error", "error": f"compose.py failed: {err_tail}"}
             return
 
         volume_out = Path("/workspace/output") / job_id
