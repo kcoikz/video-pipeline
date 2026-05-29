@@ -208,7 +208,9 @@ async def tts_start(job_id: str, folder: str, request: Request):
 
 @app.get("/tts-poll/{job_id}/{folder}")
 async def tts_poll(job_id: str, folder: str):
-    """Poll TTS background task. Returns status field so n8n IF-loop can check."""
+    """Poll TTS background task.
+    Returns 200 when done, 503 when still processing (triggers n8n retryOnFail),
+    500 on error."""
     task_key = f"{job_id}/{folder}"
     t = _tts_tasks.get(task_key)
     if t is None:
@@ -216,9 +218,9 @@ async def tts_poll(job_id: str, folder: str):
     if t["status"] == "done":
         return {"status": "done", **{k: v for k, v in t.items() if k != "status"}}
     if t["status"] == "error":
-        return {"status": "error", "error": t.get("error", "TTS failed")}
-    # Still processing — return 200 with status so n8n IF-loop handles it
-    return {"status": "processing"}
+        raise HTTPException(status_code=500, detail=t.get("error", "TTS failed"))
+    # Still processing — 503 so n8n HTTP Request retryOnFail keeps polling
+    raise HTTPException(status_code=503, detail="TTS still processing")
 
 
 # ── Image generation — FLUX Schnell via ComfyUI (legacy) ─────────
@@ -390,7 +392,9 @@ async def render_start(job_id: str, request: Request):
 
 @app.get("/render-poll/{job_id}/{video_type}")
 async def render_poll(job_id: str, video_type: str):
-    """Poll render status. Returns status field so n8n IF-loop can check."""
+    """Poll render status.
+    Returns 200 when done, 503 when still processing (triggers n8n retryOnFail),
+    500 on error."""
     task_key = f"{job_id}/{video_type}"
     t = _render_tasks.get(task_key)
     if t is None:
@@ -398,8 +402,9 @@ async def render_poll(job_id: str, video_type: str):
     if t["status"] == "done":
         return {"status": "done", **{k: v for k, v in t.items() if k != "status"}}
     if t["status"] == "error":
-        return {"status": "error", "error": t.get("error", "Render failed")}
-    return {"status": "processing"}
+        raise HTTPException(status_code=500, detail=t.get("error", "Render failed"))
+    # Still processing — 503 so n8n HTTP Request retryOnFail keeps polling
+    raise HTTPException(status_code=503, detail="Render still processing")
 
 
 @app.post("/render/{job_id}")
@@ -464,15 +469,18 @@ async def drive_start(job_id: str, request: Request):
 
 @app.get("/drive-poll/{job_id}")
 async def drive_poll(job_id: str):
-    """Poll Drive upload. Returns status field so n8n IF-loop can check."""
+    """Poll Drive upload.
+    Returns 200 when done, 503 when still processing (triggers n8n retryOnFail),
+    500 on error."""
     t = _drive_tasks.get(job_id)
     if t is None:
         raise HTTPException(status_code=404, detail=f"No drive task: {job_id}")
     if t["status"] == "done":
         return {"status": "done", **{k: v for k, v in t.items() if k != "status"}}
     if t["status"] == "error":
-        return {"status": "error", "error": t.get("error", "Upload failed")}
-    return {"status": "processing"}
+        raise HTTPException(status_code=500, detail=t.get("error", "Upload failed"))
+    # Still processing — 503 so n8n HTTP Request retryOnFail keeps polling
+    raise HTTPException(status_code=503, detail="Drive upload still processing")
 
 
 @app.post("/upload-to-drive/{job_id}")
