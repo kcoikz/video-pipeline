@@ -44,6 +44,9 @@ _drive_tasks: dict[str, dict] = {}
 # Background image batch tasks: "{job_id}/{folder}" -> {"status": ..., "total": N, "done": N, "errors": [...]}
 _image_batch_tasks: dict[str, dict] = {}
 
+# v31: Background key-art generation tasks: job_id -> {"status": ..., "path": ..., "error": ...}
+_key_art_tasks: dict[str, dict] = {}
+
 # Max concurrent ComfyUI image generations (prevents pod overload / Cloudflare 504s)
 IMAGE_BATCH_CONCURRENCY = 4
 
@@ -457,6 +460,144 @@ async def generate_batch_poll(job_id: str, folder: str):
         status_code=503,
         detail=f"Image batch processing: {t['done']}/{t['total']}",
     )
+
+
+# ── Key-art generation (v31): single hero image, higher quality ─────
+# Schnell is a distilled model so higher step counts don't help much, but a
+# larger resolution gives noticeably more detail. We render the key-art at
+# 1536x864 (50% wider/taller than scene frames) and persist it to the volume
+# so subsequent stages (Flux Redux conditioning, ffmpeg branding, archival)
+# can load it. Idempotent: if key_art.png already exists for this job_id,
+# we return immediately.
+
+KEY_ART_WIDTH  = 1536
+KEY_ART_HEIGHT = 864
+KEY_ART_STEPS  = 8   # Schnell sweet spot — diminishing returns above 8
+
+def _key_art_path(job_id: str) -> Path:
+    return JOBS_DIR / job_id / "key_art.png"
+
+def _key_art_volume_path(job_id: str) -> Path:
+    return Path("/workspace/key_art") / f"{job_id}.png"
+
+
+async def _run_key_art_background(job_id: str, prompt: str, negative: str) -> None:
+    """Generate ONE high-quality hero image via ComfyUI. Saves to both ephemeral
+    JOBS_DIR (for download endpoints) and /workspace/key_art (for persistence
+    across pod restarts and downstream stages)."""
+    try:
+        wf = copy.deepcopy(FLUX_WORKFLOW)
+        wf["6"]["inputs"]["text"]   = prompt
+        wf["7"]["inputs"]["text"]   = negative      # FLUX negative slot
+        wf["5"]["inputs"]["width"]  = KEY_ART_WIDTH
+        wf["5"]["inputs"]["height"] = KEY_ART_HEIGHT
+        wf["3"]["inputs"]["steps"]  = KEY_ART_STEPS
+        wf["3"]["inputs"]["seed"]   = int(time.time() * 1000) % 2**32
+
+        async with httpx.AsyncClient(timeout=600) as client:
+            submit = await client.post(f"{COMFY_URL}/prompt", json={"prompt": wf})
+            if submit.status_code != 200:
+                _key_art_tasks[job_id] = {"status": "error", "error": f"comfy submit {submit.status_code}: {submit.text[:300]}"}
+                return
+            prompt_id = submit.json().get("prompt_id")
+            if not prompt_id:
+                _key_art_tasks[job_id] = {"status": "error", "error": f"no prompt_id: {submit.text[:200]}"}
+                return
+
+            for _ in range(300):  # up to 5 min for key-art (it's higher quality)
+                await asyncio.sleep(1)
+                try:
+                    history = (await client.get(f"{COMFY_URL}/history/{prompt_id}")).json()
+                except Exception:
+                    continue
+                if prompt_id not in history:
+                    continue
+                for node_out in history[prompt_id].get("outputs", {}).values():
+                    images = node_out.get("images", [])
+                    if not images:
+                        continue
+                    fname = images[0]["filename"]
+                    img = await client.get(f"{COMFY_URL}/view", params={"filename": fname, "type": "output"})
+
+                    # Save to ephemeral location
+                    ephemeral = _key_art_path(job_id)
+                    ephemeral.parent.mkdir(parents=True, exist_ok=True)
+                    ephemeral.write_bytes(img.content)
+
+                    # Persist to volume
+                    persistent = _key_art_volume_path(job_id)
+                    persistent.parent.mkdir(parents=True, exist_ok=True)
+                    persistent.write_bytes(img.content)
+
+                    _key_art_tasks[job_id] = {
+                        "status": "done",
+                        "path": str(ephemeral),
+                        "volume_path": str(persistent),
+                        "download_url": f"/key-art-image/{job_id}",
+                    }
+                    return
+            _key_art_tasks[job_id] = {"status": "error", "error": "comfy timeout after 300s"}
+    except Exception as e:
+        _key_art_tasks[job_id] = {"status": "error", "error": str(e)[:300]}
+    finally:
+        _job_end(job_id)
+
+
+@app.post("/key-art-start/{job_id}")
+async def key_art_start(job_id: str, request: Request):
+    """Start key-art generation in background. Returns immediately.
+    Body: {"prompt": "...", "negative_style": "..."}
+    Poll /key-art-poll/{job_id}.
+    Idempotent: if key_art.png already exists, returns done immediately."""
+    body = await request.json()
+    prompt   = body.get("prompt", "").strip()
+    negative = body.get("negative_style", "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="prompt is required")
+
+    # Idempotency: check persistent volume first (survives pod restarts)
+    persistent = _key_art_volume_path(job_id)
+    if persistent.exists() and persistent.stat().st_size > 0:
+        _key_art_tasks[job_id] = {
+            "status": "done",
+            "path": str(persistent),
+            "volume_path": str(persistent),
+            "download_url": f"/key-art-image/{job_id}",
+            "cached": True,
+        }
+        return {"status": "already_done", "cached": True}
+
+    if _key_art_tasks.get(job_id, {}).get("status") == "processing":
+        return {"status": "already_running"}
+
+    _key_art_tasks[job_id] = {"status": "processing"}
+    _job_start(job_id)
+    asyncio.create_task(_run_key_art_background(job_id, prompt, negative))
+    return {"status": "started"}
+
+
+@app.get("/key-art-poll/{job_id}")
+async def key_art_poll(job_id: str):
+    """Poll key-art generation. 200 done, 503 processing, 500 error."""
+    t = _key_art_tasks.get(job_id)
+    if t is None:
+        raise HTTPException(status_code=404, detail=f"No key-art task: {job_id}")
+    if t["status"] == "done":
+        return {"status": "done", **{k: v for k, v in t.items() if k != "status"}}
+    if t["status"] == "error":
+        raise HTTPException(status_code=500, detail=t.get("error", "Key-art failed"))
+    raise HTTPException(status_code=503, detail="Key-art still rendering")
+
+
+@app.get("/key-art-image/{job_id}")
+async def key_art_image(job_id: str):
+    """Serve the key-art PNG for download (so Drive/Flux Redux can fetch it)."""
+    path = _key_art_volume_path(job_id)
+    if not path.exists():
+        path = _key_art_path(job_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"No key-art for {job_id}")
+    return FileResponse(str(path), media_type="image/png", filename=f"{job_id}_key_art.png")
 
 
 # ── File upload ───────────────────────────────────────────────────
