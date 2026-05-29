@@ -34,6 +34,12 @@ _render_tasks: dict[str, dict] = {}
 # Background Drive upload tasks: job_id -> {"status": ..., ...}
 _drive_tasks: dict[str, dict] = {}
 
+# Background image batch tasks: "{job_id}/{folder}" -> {"status": ..., "total": N, "done": N, "errors": [...]}
+_image_batch_tasks: dict[str, dict] = {}
+
+# Max concurrent ComfyUI image generations (prevents pod overload / Cloudflare 504s)
+IMAGE_BATCH_CONCURRENCY = 4
+
 def _job_start(job_id: str):
     _active_jobs[job_id] = time.time()
 
@@ -296,6 +302,154 @@ async def generate_and_save(job_id: str, folder: str, filename: str, request: Re
         raise HTTPException(status_code=504, detail="ComfyUI timed out")
     finally:
         _job_end(job_id)
+
+
+# ── Batch image generation (async: start + poll, bounded concurrency) ─
+
+async def _gen_one_image(client: httpx.AsyncClient, job_id: str, folder: str,
+                          filename: str, prompt: str, width: int, height: int,
+                          steps: int, task_key: str) -> None:
+    """Generate ONE image via ComfyUI and save to disk. Records any error
+    into the batch task's errors list (never raises)."""
+    try:
+        wf = copy.deepcopy(FLUX_WORKFLOW)
+        wf["6"]["inputs"]["text"]   = prompt
+        wf["5"]["inputs"]["width"]  = width
+        wf["5"]["inputs"]["height"] = height
+        wf["3"]["inputs"]["steps"]  = steps
+        wf["3"]["inputs"]["seed"]   = int(time.time() * 1000) % 2**32
+        submit = await client.post(f"{COMFY_URL}/prompt", json={"prompt": wf})
+        if submit.status_code != 200:
+            _image_batch_tasks[task_key]["errors"].append(
+                {"filename": filename, "error": f"comfy submit {submit.status_code}: {submit.text[:200]}"}
+            )
+            return
+        prompt_id = submit.json().get("prompt_id")
+        if not prompt_id:
+            _image_batch_tasks[task_key]["errors"].append(
+                {"filename": filename, "error": f"no prompt_id in: {submit.text[:200]}"}
+            )
+            return
+        # Poll ComfyUI history up to 3 min per image
+        for _ in range(180):
+            await asyncio.sleep(1)
+            try:
+                history = (await client.get(f"{COMFY_URL}/history/{prompt_id}")).json()
+            except Exception:
+                continue
+            if prompt_id not in history:
+                continue
+            for node_out in history[prompt_id].get("outputs", {}).values():
+                images = node_out.get("images", [])
+                if not images:
+                    continue
+                fname = images[0]["filename"]
+                img = await client.get(f"{COMFY_URL}/view", params={"filename": fname, "type": "output"})
+                dest = JOBS_DIR / job_id / folder
+                dest.mkdir(parents=True, exist_ok=True)
+                (dest / filename).write_bytes(img.content)
+                return
+        _image_batch_tasks[task_key]["errors"].append(
+            {"filename": filename, "error": "comfy timeout after 180s"}
+        )
+    except Exception as e:
+        _image_batch_tasks[task_key]["errors"].append(
+            {"filename": filename, "error": str(e)[:300]}
+        )
+
+
+async def _run_image_batch_background(job_id: str, folder: str, prompts: list,
+                                       width: int, height: int, steps: int,
+                                       task_key: str) -> None:
+    """Generate all prompts with bounded concurrency. Updates _image_batch_tasks."""
+    semaphore = asyncio.Semaphore(IMAGE_BATCH_CONCURRENCY)
+
+    async def gen_one(item):
+        async with semaphore:
+            async with httpx.AsyncClient(timeout=600) as client:
+                await _gen_one_image(
+                    client, job_id, folder,
+                    item["filename"], item["prompt"],
+                    width, height, steps, task_key,
+                )
+        _image_batch_tasks[task_key]["done"] += 1
+
+    try:
+        await asyncio.gather(*[gen_one(item) for item in prompts])
+        _image_batch_tasks[task_key]["status"] = "done"
+    except Exception as e:
+        _image_batch_tasks[task_key]["status"] = "error"
+        _image_batch_tasks[task_key]["error"] = str(e)
+    finally:
+        _job_end(job_id)
+
+
+@app.post("/generate-batch-start/{job_id}/{folder}")
+async def generate_batch_start(job_id: str, folder: str, request: Request):
+    """Start batch image generation in background. Returns immediately.
+
+    Body: {
+      "prompts": [{"filename": "scene_000.png", "prompt": "..."}, ...],
+      "width": 1024, "height": 576, "steps": 4
+    }
+    Then poll /generate-batch-poll/{job_id}/{folder} until status=done.
+    """
+    body = await request.json()
+    prompts = body.get("prompts", [])
+    if not prompts or not isinstance(prompts, list):
+        raise HTTPException(status_code=400, detail="prompts must be non-empty list")
+    for p in prompts:
+        if not isinstance(p, dict) or "filename" not in p or "prompt" not in p:
+            raise HTTPException(status_code=400, detail="each prompt needs {filename, prompt}")
+
+    width  = body.get("width", 1024)
+    height = body.get("height", 576)
+    steps  = body.get("steps", 4)
+
+    task_key = f"{job_id}/{folder}"
+    existing = _image_batch_tasks.get(task_key)
+    if existing and existing.get("status") == "processing":
+        return {
+            "status": "already_running",
+            "task_key": task_key,
+            "total": existing["total"],
+            "done": existing["done"],
+        }
+
+    _image_batch_tasks[task_key] = {
+        "status": "processing",
+        "total": len(prompts),
+        "done": 0,
+        "errors": [],
+    }
+    _job_start(job_id)
+    asyncio.create_task(
+        _run_image_batch_background(job_id, folder, prompts, width, height, steps, task_key)
+    )
+    return {"status": "started", "task_key": task_key, "total": len(prompts)}
+
+
+@app.get("/generate-batch-poll/{job_id}/{folder}")
+async def generate_batch_poll(job_id: str, folder: str):
+    """Poll image batch task.
+    200 when done, 503 while processing (triggers n8n loop), 500 on error."""
+    task_key = f"{job_id}/{folder}"
+    t = _image_batch_tasks.get(task_key)
+    if t is None:
+        raise HTTPException(status_code=404, detail=f"No image batch task: {task_key}")
+    if t["status"] == "done":
+        return {
+            "status": "done",
+            "total": t["total"],
+            "done": t["done"],
+            "errors": t["errors"],
+        }
+    if t["status"] == "error":
+        raise HTTPException(status_code=500, detail=t.get("error", "Image batch failed"))
+    raise HTTPException(
+        status_code=503,
+        detail=f"Image batch processing: {t['done']}/{t['total']}",
+    )
 
 
 # ── File upload ───────────────────────────────────────────────────
