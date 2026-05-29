@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import json
 import os
 import signal
 import struct
@@ -15,6 +16,12 @@ app = FastAPI()
 
 JOBS_DIR = Path("/tmp/jobs")
 JOBS_DIR.mkdir(exist_ok=True)
+
+# OAuth config — persisted on volume so it survives pod restarts.
+# Populated via POST /admin/save-oauth-config the first time.
+OAUTH_CONFIG_PATH = Path("/workspace/.oauth_config.json")
+if not OAUTH_CONFIG_PATH.parent.exists():
+    OAUTH_CONFIG_PATH = Path("/tmp/.oauth_config.json")
 
 CHATTERBOX_URL = "http://127.0.0.1:8004"
 COMFY_URL = "http://127.0.0.1:8188"
@@ -595,12 +602,100 @@ async def download_video(job_id: str, video_type: str):
     return FileResponse(str(path), media_type="video/mp4", filename=f"{job_id}_{video_type}.mp4")
 
 
-# ── Upload videos to Google Drive (async: start + poll) ───────────
+# ── Upload videos to Google Drive (async: start + poll, OAuth user-token) ───
 
-async def _run_drive_background(job_id: str, access_token: str, parent_folder_id: str, case_name: str):
+def _load_oauth_config() -> dict:
+    """Read OAuth config from volume file or env vars (env wins)."""
+    cfg = {}
+    if OAUTH_CONFIG_PATH.exists():
+        try:
+            cfg = json.loads(OAUTH_CONFIG_PATH.read_text())
+        except Exception:
+            cfg = {}
+    # Env vars override file
+    for k_env, k_cfg in [
+        ("GOOGLE_CLIENT_ID",        "client_id"),
+        ("GOOGLE_CLIENT_SECRET",    "client_secret"),
+        ("GOOGLE_REFRESH_TOKEN",    "refresh_token"),
+        ("DRIVE_PARENT_FOLDER_ID",  "parent_folder_id"),
+    ]:
+        v = os.environ.get(k_env)
+        if v:
+            cfg[k_cfg] = v
+    return cfg
+
+
+async def _get_drive_access_token() -> str:
+    """Exchange refresh_token for a fresh access_token. Called on every upload."""
+    cfg = _load_oauth_config()
+    missing = [k for k in ("client_id", "client_secret", "refresh_token") if not cfg.get(k)]
+    if missing:
+        raise HTTPException(
+            status_code=500,
+            detail=f"OAuth not configured (missing: {missing}). POST /admin/save-oauth-config first.",
+        )
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "grant_type":    "refresh_token",
+                "refresh_token": cfg["refresh_token"],
+                "client_id":     cfg["client_id"],
+                "client_secret": cfg["client_secret"],
+            },
+        )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=500, detail=f"OAuth token refresh failed: {resp.text[:300]}")
+    return resp.json()["access_token"]
+
+
+@app.post("/admin/save-oauth-config")
+async def save_oauth_config(request: Request):
+    """One-time setup: save OAuth client_id / secret / refresh_token / parent_folder_id
+    to the volume so the server uses them for Drive uploads."""
+    body = await request.json()
+    required = ["client_id", "client_secret", "refresh_token", "parent_folder_id"]
+    missing = [k for k in required if k not in body]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing: {missing}")
+    OAUTH_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    OAUTH_CONFIG_PATH.write_text(json.dumps({k: body[k] for k in required}, indent=2))
+    OAUTH_CONFIG_PATH.chmod(0o600)
+    return {"status": "saved", "path": str(OAUTH_CONFIG_PATH)}
+
+
+@app.get("/admin/oauth-config-status")
+async def oauth_config_status():
+    """Quick check that OAuth is wired up (does NOT leak the secrets)."""
+    cfg = _load_oauth_config()
+    return {
+        "configured":      all(cfg.get(k) for k in ("client_id", "client_secret", "refresh_token")),
+        "has_parent_folder": bool(cfg.get("parent_folder_id")),
+        "config_path":     str(OAUTH_CONFIG_PATH),
+        "file_exists":     OAUTH_CONFIG_PATH.exists(),
+    }
+
+
+async def _run_drive_background(job_id: str, case_name: str, parent_folder_id: str | None):
     try:
+        access_token = await _get_drive_access_token()
+        if not parent_folder_id:
+            parent_folder_id = _load_oauth_config().get("parent_folder_id")
+        if not parent_folder_id:
+            raise HTTPException(status_code=500, detail="No parent_folder_id provided or configured")
         result = await _do_upload_to_drive(job_id, access_token, parent_folder_id, case_name)
-        _drive_tasks[job_id] = {"status": "done", **result}
+        # Bug fix: if BOTH videos failed, mark task as error (not done)
+        short_err = "error" in (result.get("short_en") or {})
+        sleep_err = "error" in (result.get("sleep_en") or {})
+        if short_err and sleep_err:
+            _drive_tasks[job_id] = {
+                "status": "error",
+                "error":  f"Both uploads failed. short_en: {result['short_en'].get('error', '?')[:200]} | sleep_en: {result['sleep_en'].get('error', '?')[:200]}",
+            }
+        else:
+            _drive_tasks[job_id] = {"status": "done", **result}
+    except HTTPException as he:
+        _drive_tasks[job_id] = {"status": "error", "error": str(he.detail)}
     except Exception as e:
         _drive_tasks[job_id] = {"status": "error", "error": str(e)}
     finally:
@@ -609,14 +704,18 @@ async def _run_drive_background(job_id: str, access_token: str, parent_folder_id
 
 @app.post("/drive-start/{job_id}")
 async def drive_start(job_id: str, request: Request):
-    """Start Drive upload in background. Poll /drive-poll/{job_id}."""
+    """Start Drive upload in background. Poll /drive-poll/{job_id}.
+    Body: {"case_name": "...", "folder_id": "..."(optional, falls back to env/config)}
+    """
     body = await request.json()
     if _drive_tasks.get(job_id, {}).get("status") == "processing":
         return {"status": "already_running"}
     _drive_tasks[job_id] = {"status": "processing"}
     _job_start(job_id)
     asyncio.create_task(_run_drive_background(
-        job_id, body["access_token"], body["folder_id"], body.get("case_name", job_id)
+        job_id,
+        body.get("case_name", job_id),
+        body.get("folder_id"),
     ))
     return {"status": "started"}
 
@@ -635,25 +734,6 @@ async def drive_poll(job_id: str):
         raise HTTPException(status_code=500, detail=t.get("error", "Upload failed"))
     # Still processing — 503 so n8n HTTP Request retryOnFail keeps polling
     raise HTTPException(status_code=503, detail="Drive upload still processing")
-
-
-@app.post("/upload-to-drive/{job_id}")
-async def upload_to_drive(job_id: str, request: Request):
-    """Legacy sync endpoint — use /drive-start + /drive-poll instead."""
-    body = await request.json()
-    _drive_tasks[job_id] = {"status": "processing"}
-    _job_start(job_id)
-    asyncio.create_task(_run_drive_background(
-        job_id, body["access_token"], body["folder_id"], body.get("case_name", job_id)
-    ))
-    for _ in range(18):  # wait up to 90s
-        await asyncio.sleep(5)
-        t = _drive_tasks.get(job_id, {})
-        if t.get("status") == "done":
-            return {k: v for k, v in t.items() if k != "status"}
-        if t.get("status") == "error":
-            raise HTTPException(status_code=500, detail=t.get("error", "Upload failed"))
-    raise HTTPException(status_code=503, detail="Upload still processing — use /drive-poll")
 
 
 async def _do_upload_to_drive(job_id: str, access_token: str, parent_folder_id: str, case_name: str):
