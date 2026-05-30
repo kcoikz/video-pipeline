@@ -2,6 +2,7 @@ import asyncio
 import copy
 import json
 import os
+import re
 import signal
 import struct
 import subprocess
@@ -161,20 +162,45 @@ async def tts(request: Request):
 
 # ── TTS + save (pipeline uses this — async: start then poll) ──────
 
+_SLEEP_CHAPTER_RE = re.compile(r'^sleep_ch([1-5])$')
+
+
+def _is_sleep_chapter(folder: str) -> bool:
+    """True for v32 per-chapter sleep folders: sleep_ch1 .. sleep_ch5."""
+    return bool(_SLEEP_CHAPTER_RE.match(folder))
+
+
 async def _run_tts_background(job_id: str, folder: str, body: dict, task_key: str):
-    """Background coroutine: calls Chatterbox, saves WAV, updates _tts_tasks."""
+    """Background coroutine: calls Chatterbox, saves WAV, updates _tts_tasks.
+
+    v32: sleep chapters (folder='sleep_ch1'..'sleep_ch5') are saved to
+    {JOBS_DIR}/{job_id}/audio/sleep_ch{N}.wav instead of the old
+    {job_id}/{folder}/en_audio.wav, so each chapter has its own audio file
+    for per-chapter render alignment.
+    """
     try:
         body.setdefault("voice_mode", "predefined")
         body.setdefault("predefined_voice_id", "Emily.wav")
         async with httpx.AsyncClient(timeout=1800) as client:
             resp = await client.post(f"{CHATTERBOX_URL}/tts", json=body)
             if resp.status_code != 200:
-                _tts_tasks[task_key] = {"status": "error", "error": resp.text}
+                err_msg = resp.text[:500]
+                print(f"[TTS_ERR] job={job_id} folder={folder} chatterbox_status={resp.status_code} err={err_msg!r}")
+                _tts_tasks[task_key] = {"status": "error", "error": err_msg}
                 return
         wav = resp.content
-        dest = JOBS_DIR / job_id / folder
-        dest.mkdir(parents=True, exist_ok=True)
-        (dest / "en_audio.wav").write_bytes(wav)
+
+        # v32: sleep chapters → {job_id}/audio/sleep_ch{N}.wav
+        if _is_sleep_chapter(folder):
+            dest_dir = JOBS_DIR / job_id / "audio"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest_file = dest_dir / f"{folder}.wav"
+        else:
+            dest_dir = JOBS_DIR / job_id / folder
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest_file = dest_dir / "en_audio.wav"
+
+        dest_file.write_bytes(wav)
         duration_sec = _wav_duration(wav)
         scene_count = max(1, int(duration_sec / 20))
         _tts_tasks[task_key] = {
@@ -184,6 +210,7 @@ async def _run_tts_background(job_id: str, folder: str, body: dict, task_key: st
             "scene_count": scene_count,
         }
     except Exception as e:
+        print(f"[TTS_ERR] job={job_id} folder={folder} exc={e}")
         _tts_tasks[task_key] = {"status": "error", "error": str(e)}
     finally:
         _job_end(job_id)
@@ -211,7 +238,17 @@ async def tts_upload(job_id: str, folder: str, request: Request):
 
 @app.post("/tts-start/{job_id}/{folder}")
 async def tts_start(job_id: str, folder: str, request: Request):
-    """Start TTS in background. Returns immediately. Poll /tts-poll/{job_id}/{folder}."""
+    """Start TTS in background. Returns immediately. Poll /tts-poll/{job_id}/{folder}.
+
+    v32: folder='sleep' is no longer valid — use sleep_ch1..sleep_ch5 instead.
+    """
+    # v32: old monolithic sleep endpoint removed to avoid confusion
+    if folder == "sleep":
+        raise HTTPException(
+            status_code=404,
+            detail="Old /tts-start/{job_id}/sleep endpoint removed in v32. "
+                   "Use /tts-start/{job_id}/sleep_ch{N} (N=1..5) for per-chapter TTS.",
+        )
     body = await request.json()
     task_key = f"{job_id}/{folder}"
     if _tts_tasks.get(task_key, {}).get("status") == "processing":
@@ -350,15 +387,26 @@ def _build_img2img_workflow(prompt: str, width: int, height: int,
 
 
 async def _gen_one_image(client: httpx.AsyncClient, job_id: str, folder: str,
-                          filename: str, prompt: str, width: int, height: int,
-                          steps: int, task_key: str,
-                          keyart_ref: str | None = None) -> None:
-    """Generate ONE image via ComfyUI and save to disk. Records any error
-    into the batch task's errors list (never raises).
+                          idx: int, filename: str, prompt: str,
+                          width: int, height: int, steps: int, task_key: str,
+                          keyart_ref: str | None = None) -> bool:
+    """Generate ONE image via ComfyUI and save to disk.
+
+    Returns True on success, False on any failure.
+    Records failures into the batch task's errors list (never raises).
+    Includes structured log lines for grep-able debugging.
 
     v31 Step 4: if keyart_ref is set (filename inside ComfyUI's input dir),
     builds an img2img workflow conditioned on that reference image. Otherwise
-    falls back to plain text-to-image with FLUX_WORKFLOW."""
+    falls back to plain text-to-image with FLUX_WORKFLOW.
+    v32: now returns bool so caller can track done vs failed counts separately.
+    """
+    def _record_error(msg: str) -> bool:
+        full_msg = msg[:400]
+        _image_batch_tasks[task_key]["errors"].append({"filename": filename, "error": full_msg})
+        print(f"[IMG_ERR] job={job_id} folder={folder} chunk_id={idx} file={filename} err={full_msg!r}")
+        return False
+
     try:
         seed = int(time.time() * 1000) % 2**32
         if keyart_ref:
@@ -372,16 +420,10 @@ async def _gen_one_image(client: httpx.AsyncClient, job_id: str, folder: str,
             wf["3"]["inputs"]["seed"]   = seed
         submit = await client.post(f"{COMFY_URL}/prompt", json={"prompt": wf})
         if submit.status_code != 200:
-            _image_batch_tasks[task_key]["errors"].append(
-                {"filename": filename, "error": f"comfy submit {submit.status_code}: {submit.text[:200]}"}
-            )
-            return
+            return _record_error(f"comfy submit {submit.status_code}: {submit.text[:200]}")
         prompt_id = submit.json().get("prompt_id")
         if not prompt_id:
-            _image_batch_tasks[task_key]["errors"].append(
-                {"filename": filename, "error": f"no prompt_id in: {submit.text[:200]}"}
-            )
-            return
+            return _record_error(f"no prompt_id in: {submit.text[:200]}")
         # Poll ComfyUI history up to 3 min per image
         for _ in range(180):
             await asyncio.sleep(1)
@@ -400,14 +442,10 @@ async def _gen_one_image(client: httpx.AsyncClient, job_id: str, folder: str,
                 dest = JOBS_DIR / job_id / folder
                 dest.mkdir(parents=True, exist_ok=True)
                 (dest / filename).write_bytes(img.content)
-                return
-        _image_batch_tasks[task_key]["errors"].append(
-            {"filename": filename, "error": "comfy timeout after 180s"}
-        )
+                return True
+        return _record_error("comfy timeout after 180s")
     except Exception as e:
-        _image_batch_tasks[task_key]["errors"].append(
-            {"filename": filename, "error": str(e)[:300]}
-        )
+        return _record_error(str(e)[:300])
 
 
 async def _run_image_batch_background(job_id: str, folder: str, prompts: list,
@@ -437,19 +475,23 @@ async def _run_image_batch_background(job_id: str, folder: str, prompts: list,
             )
             keyart_ref = None
 
-    async def gen_one(item):
+    async def gen_one(idx: int, item: dict):
         async with semaphore:
             async with httpx.AsyncClient(timeout=600) as client:
-                await _gen_one_image(
+                ok = await _gen_one_image(
                     client, job_id, folder,
-                    item["filename"], item["prompt"],
+                    idx, item["filename"], item["prompt"],
                     width, height, steps, task_key,
                     keyart_ref=keyart_ref,
                 )
-        _image_batch_tasks[task_key]["done"] += 1
+        # v32: only count successful generations; track failed indices separately
+        if ok:
+            _image_batch_tasks[task_key]["done"] += 1
+        else:
+            _image_batch_tasks[task_key]["failed_indices"].append(idx)
 
     try:
-        await asyncio.gather(*[gen_one(item) for item in prompts])
+        await asyncio.gather(*[gen_one(i, item) for i, item in enumerate(prompts)])
         _image_batch_tasks[task_key]["status"] = "done"
         _image_batch_tasks[task_key]["mode"] = "img2img" if keyart_ref else "txt2img"
     except Exception as e:
@@ -496,6 +538,7 @@ async def generate_batch_start(job_id: str, folder: str, request: Request):
         "total": len(prompts),
         "done": 0,
         "errors": [],
+        "failed_indices": [],   # v32: 0-based indices of failed chunks
     }
     _job_start(job_id)
     asyncio.create_task(
@@ -517,6 +560,7 @@ async def generate_batch_poll(job_id: str, folder: str):
             "status": "done",
             "total": t["total"],
             "done": t["done"],
+            "failed": sorted(t.get("failed_indices", [])),  # v32: always present, even if empty
             "errors": t["errors"],
         }
     if t["status"] == "error":
@@ -677,24 +721,33 @@ async def upload_file(job_id: str, folder: str, filename: str, request: Request)
 
 # ── Render — FFmpeg slideshow (async: start + poll) ───────────────
 
-async def _run_render_background(job_id: str, video_type: str, scene_count: int, scene_dur: int, task_key: str):
-    """Run the cinematic composer (compose.py) in a thread so we don't block the event loop.
+def _locate_compose_script() -> Path:
+    """Find compose.py — next to server.py, or fall back to workspace path."""
+    p = Path(__file__).resolve().parent / "compose.py"
+    if not p.exists():
+        p = Path("/workspace/code/runpod-server/compose.py")
+    return p
 
-    v31 Step 6: delegates to compose.py which builds a complex ffmpeg filter graph
-    (zoompan + xfade + lut3d + film grain overlay + vignette + audio fades) instead
-    of the old concat-demuxer slideshow.
+
+async def _run_render_background(
+    job_id: str,
+    video_type: str,
+    scene_count: int,
+    scene_dur: float,           # v32: float for exact audio sync
+    task_key: str,
+    failed_chunks: list[int] | None = None,
+):
+    """Run the cinematic composer (compose.py) in a thread (short video or legacy sleep).
+
+    v31 Step 6: delegates to compose.py (zoompan + xfade + lut3d + grain + vignette + afade).
+    v32: scene_dur is float; failed_chunks substituted in compose.py.
     """
     import shutil
-    folder    = "short" if "short" in video_type else "sleep"
-    job_path  = JOBS_DIR / job_id / folder
+    folder     = "short" if "short" in video_type else "sleep"
+    job_path   = JOBS_DIR / job_id / folder
     audio_path = job_path / "en_audio.wav"
     output_mp4 = JOBS_DIR / job_id / f"{video_type}.mp4"
-
-    # Locate compose.py — it lives next to server.py on the pod.
-    compose_script = Path(__file__).resolve().parent / "compose.py"
-    if not compose_script.exists():
-        # Fallback to the conventional workspace path.
-        compose_script = Path("/workspace/code/runpod-server/compose.py")
+    compose_script = _locate_compose_script()
 
     try:
         if not audio_path.exists():
@@ -714,7 +767,9 @@ async def _run_render_background(job_id: str, video_type: str, scene_count: int,
             "--output",      str(output_mp4),
             "--jobs-dir",    str(JOBS_DIR),
         ]
-        # Run blocking compose.py in thread pool so event loop stays free
+        if failed_chunks:
+            cmd.extend(["--failed-chunks", ",".join(str(x) for x in failed_chunks)])
+
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None, lambda: subprocess.run(cmd, capture_output=True, text=True)
@@ -740,21 +795,193 @@ async def _run_render_background(job_id: str, video_type: str, scene_count: int,
         _job_end(job_id)
 
 
+async def _run_render_sleep_background(
+    job_id: str,
+    audio_files: list[str],     # e.g. ["sleep_ch1.wav", ..., "sleep_ch5.wav"]
+    chapters: list[dict],       # [{duration_sec, scene_count, scene_offset}, ...]
+    failed_chunks: list[int],   # global image indices to substitute
+    task_key: str,
+):
+    """v32 per-chapter sleep render.
+
+    For each chapter:
+      1. Determine scene_dur_i = duration_sec_i / scene_count_i
+      2. Run compose.py with the chapter's image range (scene_offset) and audio
+      3. Save intermediate to {job_id}/render/chapter_{i}.mp4
+
+    After all chapters: concat with ffmpeg -f concat (stream copy, no re-encode).
+    Cinematic effects apply per-chapter so xfade never cuts across chapter boundaries.
+    Intermediate chapter mp4s are retained in the render/ dir for retry resilience.
+    """
+    import shutil
+
+    audio_dir = JOBS_DIR / job_id / "audio"
+    render_dir = JOBS_DIR / job_id / "render"
+    render_dir.mkdir(parents=True, exist_ok=True)
+    compose_script = _locate_compose_script()
+
+    if not compose_script.exists():
+        _render_tasks[task_key] = {"status": "error", "error": f"compose.py not found at {compose_script}"}
+        _job_end(job_id)
+        return
+
+    failed_set = set(failed_chunks)
+    chapter_mp4s: list[Path] = []
+
+    try:
+        for i, chapter in enumerate(chapters, start=1):
+            audio_filename  = audio_files[i - 1] if (i - 1) < len(audio_files) else f"sleep_ch{i}.wav"
+            audio_path      = audio_dir / audio_filename
+            duration_sec    = float(chapter["duration_sec"])
+            scene_count     = int(chapter["scene_count"])
+            scene_offset    = int(chapter["scene_offset"])
+            scene_dur       = duration_sec / scene_count if scene_count > 0 else 8.0
+            chapter_mp4     = render_dir / f"chapter_{i}.mp4"
+
+            if not audio_path.exists():
+                _render_tasks[task_key] = {
+                    "status": "error",
+                    "error": f"Chapter {i} audio not found: {audio_path}",
+                }
+                return
+
+            # Global failed indices that fall inside this chapter's range
+            ch_failed = [
+                idx for idx in failed_set
+                if scene_offset <= idx < scene_offset + scene_count
+            ]
+
+            cmd = [
+                "python3", str(compose_script),
+                "--job-id",       job_id,
+                "--video-type",   "sleep_en",
+                "--scene-count",  str(scene_count),
+                "--scene-dur",    f"{scene_dur:.6f}",
+                "--scene-offset", str(scene_offset),
+                "--audio",        str(audio_path),
+                "--output",       str(chapter_mp4),
+                "--jobs-dir",     str(JOBS_DIR),
+            ]
+            if ch_failed:
+                cmd.extend(["--failed-chunks", ",".join(str(x) for x in ch_failed)])
+
+            print(f"[RENDER] job={job_id} chapter={i}/{len(chapters)} "
+                  f"scenes={scene_offset}..{scene_offset+scene_count-1} "
+                  f"dur={scene_dur:.3f}s failed={len(ch_failed)}")
+
+            loop = asyncio.get_event_loop()
+            # Capture cmd in lambda default to avoid closure-over-loop-variable bug
+            result = await loop.run_in_executor(
+                None, lambda c=cmd: subprocess.run(c, capture_output=True, text=True)
+            )
+            if result.returncode != 0:
+                err = (result.stderr or result.stdout or "")[-1000:]
+                _render_tasks[task_key] = {
+                    "status": "error",
+                    "error": f"compose.py chapter {i} failed: {err}",
+                }
+                return
+
+            chapter_mp4s.append(chapter_mp4)
+
+        # ── Concat all chapter mp4s (stream copy — no re-encode) ──────────
+        output_mp4  = JOBS_DIR / job_id / "sleep_en.mp4"
+        concat_txt  = render_dir / "chapters.txt"
+        concat_txt.write_text(
+            "\n".join(f"file '{p.resolve()}'" for p in chapter_mp4s)
+        )
+
+        concat_cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0", "-i", str(concat_txt),
+            "-c", "copy",
+            str(output_mp4),
+        ]
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, lambda: subprocess.run(concat_cmd, capture_output=True, text=True)
+        )
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "")[-800:]
+            _render_tasks[task_key] = {"status": "error", "error": f"concat failed: {err}"}
+            return
+
+        volume_out = Path("/workspace/output") / job_id
+        volume_out.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(output_mp4), str(volume_out / "sleep_en.mp4"))
+
+        _render_tasks[task_key] = {
+            "status": "done",
+            "render_id": f"{job_id}_sleep_en",
+            "download_url": f"/download/{job_id}/sleep_en",
+            "volume_path": f"/workspace/output/{job_id}/sleep_en.mp4",
+        }
+    except Exception as e:
+        _render_tasks[task_key] = {"status": "error", "error": str(e)}
+    finally:
+        _job_end(job_id)
+
+
 @app.post("/render-start/{job_id}")
 async def render_start(job_id: str, request: Request):
-    """Start render in background. Poll /render-poll/{job_id}/{video_type}."""
-    body        = await request.json()
-    video_type  = body.get("type", "short_en")
-    scene_count = int(body.get("scene_count", 9))
-    scene_dur   = int(body.get("scene_duration", 20))
-    task_key    = f"{job_id}/{video_type}"
+    """Start render in background. Poll /render-poll/{job_id}/{video_type}.
+
+    v32 body variants:
+
+    Short (or any non-chapter video):
+      {
+        "type": "short_en",
+        "scene_count": 100,
+        "audio_duration": 893.4,    # optional, informational
+        "scene_duration": 8.934,    # float — audio_duration / scene_count
+        "failed_chunks": []
+      }
+
+    Sleep (per-chapter):
+      {
+        "type": "sleep_en",
+        "audio_files": ["sleep_ch1.wav", ..., "sleep_ch5.wav"],
+        "chapters": [
+          {"duration_sec": 720.5, "scene_count": 90, "scene_offset": 0},
+          ...
+        ],
+        "failed_chunks": []
+      }
+
+    Backward compat: old body {"type", "scene_count", "scene_duration"} still works.
+    """
+    body       = await request.json()
+    video_type = body.get("type", "short_en")
+    task_key   = f"{job_id}/{video_type}"
 
     if _render_tasks.get(task_key, {}).get("status") == "processing":
         return {"status": "already_running", "task_key": task_key}
 
     _render_tasks[task_key] = {"status": "processing"}
     _job_start(job_id)
-    asyncio.create_task(_run_render_background(job_id, video_type, scene_count, scene_dur, task_key))
+
+    failed_chunks: list[int] = [int(x) for x in body.get("failed_chunks", [])]
+
+    # v32 per-chapter sleep path
+    if "sleep" in video_type and "chapters" in body:
+        audio_files: list[str] = body.get("audio_files", [])
+        chapters:    list[dict] = body.get("chapters", [])
+        if not audio_files or not chapters:
+            _render_tasks[task_key] = {"status": "error", "error": "sleep render requires audio_files and chapters"}
+            _job_end(job_id)
+            return {"status": "error", "detail": "sleep render requires audio_files and chapters"}
+        asyncio.create_task(
+            _run_render_sleep_background(job_id, audio_files, chapters, failed_chunks, task_key)
+        )
+        return {"status": "started", "task_key": task_key, "mode": "per_chapter_sleep"}
+
+    # Short (or legacy single-audio sleep)
+    scene_count = int(body.get("scene_count", 9))
+    # scene_duration is float since v32; fall back to legacy scene_dur key too
+    scene_dur   = float(body.get("scene_duration", body.get("scene_dur", 8.0)))
+    asyncio.create_task(
+        _run_render_background(job_id, video_type, scene_count, scene_dur, task_key, failed_chunks)
+    )
     return {"status": "started", "task_key": task_key}
 
 

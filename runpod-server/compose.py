@@ -53,9 +53,9 @@ FADE_DUR = 1.0       # crossfade duration in seconds
 AUDIO_FADE = 2.0     # in/out audio fade duration
 
 
-def _per_clip_filter(in_idx: int, duration: int, zoom_dir: str) -> str:
+def _per_clip_filter(in_idx: int, duration: float, zoom_dir: str) -> str:
     """Build the per-clip filter chain: scale → zoompan → format → label."""
-    zoom_frames = duration * FPS
+    zoom_frames = max(1, round(duration * FPS))
     step = 0.05 / zoom_frames  # 1.0 → 1.05 over duration
 
     # zoompan z expression and x/y anchoring vary by direction
@@ -88,24 +88,52 @@ def compose(
     job_id: str,
     video_type: str,
     scene_count: int,
-    scene_dur: int,
+    scene_dur: float,           # was int — now float for exact audio sync
     audio_path: Path,
     output_path: Path,
     jobs_dir: Path,
+    scene_offset: int = 0,      # first global image index for this render (sleep chapters)
+    failed_chunks: list[int] | None = None,  # global indices to substitute
 ) -> str:
     """Build and run the cinematic ffmpeg pipeline. Returns output path."""
     folder = "short" if "short" in video_type else "sleep"
     job_path = jobs_dir / job_id / folder
+    failed_set: set[int] = set(failed_chunks or [])
 
-    # Collect image paths in order
+    # ── Collect image paths ───────────────────────────────────────────
+    # First pass: find all valid images in the requested range.
+    valid: dict[int, Path] = {}
+    for i in range(scene_offset, scene_offset + scene_count):
+        for ext in ("png", "jpg"):
+            img = job_path / f"scene_{i:03d}.{ext}"
+            if img.exists():
+                valid[i] = img
+                break
+
+    # Second pass: build clip list substituting failed / missing frames.
     clips: list[Path] = []
-    for i in range(scene_count):
-        img = job_path / f"scene_{i:03d}.png"
-        if not img.exists():
-            img = job_path / f"scene_{i:03d}.jpg"
-        if not img.exists():
-            raise FileNotFoundError(f"Missing scene image at index {i}")
-        clips.append(img)
+    all_valid_sorted = sorted(valid.keys())
+    for i in range(scene_offset, scene_offset + scene_count):
+        if i not in failed_set and i in valid:
+            clips.append(valid[i])
+            continue
+        # Need a substitute — prefer nearest PRIOR valid non-failed frame.
+        sub: Path | None = None
+        for j in range(i - 1, scene_offset - 1, -1):
+            if j in valid and j not in failed_set:
+                sub = valid[j]
+                break
+        if sub is None:
+            for j in range(i + 1, scene_offset + scene_count):
+                if j in valid and j not in failed_set:
+                    sub = valid[j]
+                    break
+        if sub is None:
+            raise FileNotFoundError(
+                f"No valid frames available to substitute for index {i} "
+                f"(scene_offset={scene_offset}, scene_count={scene_count})"
+            )
+        clips.append(sub)
 
     if not clips:
         raise ValueError("scene_count is 0 — nothing to render")
@@ -212,15 +240,27 @@ def compose(
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="v31 Step 6 cinematic composer")
-    p.add_argument("--job-id",       required=True)
-    p.add_argument("--video-type",   required=True)
-    p.add_argument("--scene-count",  type=int, required=True)
-    p.add_argument("--scene-dur",    type=int, required=True)
-    p.add_argument("--audio",        required=True)
-    p.add_argument("--output",       required=True)
-    p.add_argument("--jobs-dir",     default="/tmp/jobs")
+    p = argparse.ArgumentParser(description="v32 cinematic composer")
+    p.add_argument("--job-id",        required=True)
+    p.add_argument("--video-type",    required=True)
+    p.add_argument("--scene-count",   type=int,   required=True)
+    p.add_argument("--scene-dur",     type=float, required=True)   # float since v32
+    p.add_argument("--audio",         required=True)
+    p.add_argument("--output",        required=True)
+    p.add_argument("--jobs-dir",      default="/tmp/jobs")
+    p.add_argument("--scene-offset",  type=int,   default=0,
+                   help="First global image index for this render (sleep chapters)")
+    p.add_argument("--failed-chunks", type=str,   default="",
+                   help="Comma-separated global image indices to substitute")
     args = p.parse_args()
+
+    failed: list[int] = []
+    if args.failed_chunks.strip():
+        try:
+            failed = [int(x) for x in args.failed_chunks.split(",") if x.strip()]
+        except ValueError as e:
+            print(f"ERROR: --failed-chunks parse error: {e}", file=sys.stderr)
+            return 1
 
     try:
         out = compose(
@@ -231,6 +271,8 @@ def main() -> int:
             Path(args.audio),
             Path(args.output),
             Path(args.jobs_dir),
+            scene_offset=args.scene_offset,
+            failed_chunks=failed,
         )
         print(f"OK: {out}")
         return 0
