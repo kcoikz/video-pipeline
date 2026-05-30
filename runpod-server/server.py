@@ -660,7 +660,11 @@ async def key_art_start(job_id: str, request: Request):
     Idempotent: if key_art.png already exists, returns done immediately."""
     body = await request.json()
     prompt   = body.get("prompt", "").strip()
-    negative = body.get("negative_style", "").strip()
+    _neg_raw = body.get("negative_style", "")
+    if isinstance(_neg_raw, list):
+        negative = ", ".join(str(x) for x in _neg_raw)
+    else:
+        negative = str(_neg_raw).strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
 
