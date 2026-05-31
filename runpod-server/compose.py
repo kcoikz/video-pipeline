@@ -39,6 +39,25 @@ import subprocess
 import sys
 from pathlib import Path
 
+
+def get_audio_duration(audio_path: Path) -> float:
+    """Return actual audio duration in seconds via ffprobe."""
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(audio_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError(
+            f"ffprobe failed to read duration from {audio_path}: {result.stderr}"
+        )
+    return float(result.stdout.strip())
+
 # Asset paths — files are optional. If missing, the corresponding filter is
 # skipped. Drop a .cube and a grain.mp4 here to enable the full cinematic look.
 ASSETS_DIR = Path("/workspace/assets")
@@ -140,15 +159,37 @@ def compose(
     if not audio_path.exists():
         raise FileNotFoundError(f"Audio not found: {audio_path}")
 
+    # ── Duration correction ───────────────────────────────────────────
+    # Get the true audio duration via ffprobe, then back-calculate the
+    # per-clip duration so that:
+    #   total_video_dur = corrected_scene_dur * N - FADE_DUR * (N - 1)
+    #                   = audio_dur  (exactly — no frozen frames, no cutoff)
+    #
+    # Formula derivation:
+    #   total_dur = c * N - FADE_DUR * (N - 1) = audio_dur
+    #   => c = (audio_dur + FADE_DUR * (N - 1)) / N
+    audio_dur = get_audio_duration(audio_path)
+    N = len(clips)
+    if N > 1:
+        corrected_scene_dur = (audio_dur + FADE_DUR * (N - 1)) / N
+    else:
+        corrected_scene_dur = audio_dur  # single clip — no xfade
+
+    if N > 1 and corrected_scene_dur <= FADE_DUR:
+        raise ValueError(
+            f"corrected_scene_dur={corrected_scene_dur:.3f}s ≤ FADE_DUR={FADE_DUR}s "
+            f"(audio={audio_dur:.1f}s, N={N}). Too many scenes for audio length."
+        )
+
     has_lut   = LUT_PATH.exists()
     has_grain = GRAIN_PATH.exists()
 
     # ── Build inputs ──────────────────────────────────────────────────
     cmd: list[str] = ["ffmpeg", "-y"]
 
-    # One -loop input per scene image
+    # One -loop input per scene image, duration = corrected_scene_dur
     for img in clips:
-        cmd.extend(["-loop", "1", "-t", str(scene_dur), "-i", str(img)])
+        cmd.extend(["-loop", "1", "-t", f"{corrected_scene_dur:.6f}", "-i", str(img)])
 
     audio_idx = len(clips)
     cmd.extend(["-i", str(audio_path)])
@@ -162,23 +203,23 @@ def compose(
     parts: list[str] = []
     directions = ["in_center", "out_center", "in_left", "out_right"]
 
-    # Per-clip zoompan
-    for i in range(len(clips)):
-        parts.append(_per_clip_filter(i, scene_dur, directions[i % 4]))
+    # Per-clip zoompan — uses corrected_scene_dur so frame count is exact
+    for i in range(N):
+        parts.append(_per_clip_filter(i, corrected_scene_dur, directions[i % 4]))
 
-    # xfade chain — each xfade overlaps previous's end with next's start
-    if len(clips) == 1:
+    # xfade chain — each xfade overlaps previous clip's end with next's start
+    if N == 1:
         prev = "clip0"
     else:
         prev = "clip0"
-        for i in range(1, len(clips)):
-            # Offset = (clips already in chain) * scene_dur - fade_dur
-            # The xfade starts FADE_DUR seconds before previous clip ends
-            offset = scene_dur * i - FADE_DUR * i
+        for i in range(1, N):
+            # Each clip contributes (corrected_scene_dur - FADE_DUR) of unique time.
+            # xfade at position i starts at corrected_scene_dur*i - FADE_DUR*i.
+            offset = corrected_scene_dur * i - FADE_DUR * i
             label = f"x{i}"
             parts.append(
                 f"[{prev}][clip{i}]"
-                f"xfade=transition=fade:duration={FADE_DUR}:offset={offset:.3f}"
+                f"xfade=transition=fade:duration={FADE_DUR}:offset={offset:.6f}"
                 f"[{label}]"
             )
             prev = label
@@ -195,7 +236,7 @@ def compose(
             f"format=yuv420p[g]"
         )
         parts.append(
-            f"[{prev}][g]blend=all_mode=screen:all_opacity=0.18:shortest=0,"
+            f"[{prev}][g]blend=all_mode=screen:all_opacity=0.18:shortest=1,"
             f"format=yuv420p[grained]"
         )
         prev = "grained"
@@ -203,14 +244,14 @@ def compose(
     # Vignette (always on — cheap and dramatic)
     parts.append(f"[{prev}]vignette=PI/4[vfinal]")
 
-    # Audio fades
-    # total video duration ≈ scene_dur * N - FADE_DUR * (N-1) due to overlapping
-    total_dur = scene_dur * len(clips) - FADE_DUR * (len(clips) - 1)
-    audio_fade_out_start = max(0, total_dur - AUDIO_FADE)
+    # Audio fades — anchored to real audio duration (from ffprobe), NOT to
+    # the estimated total_dur. This ensures the fade-out happens at the
+    # actual end of the audio track, not early due to xfade overlap math.
+    audio_fade_out_start = max(0.0, audio_dur - AUDIO_FADE)
     parts.append(
         f"[{audio_idx}:a]"
         f"afade=t=in:st=0:d={AUDIO_FADE},"
-        f"afade=t=out:st={audio_fade_out_start:.2f}:d={AUDIO_FADE}"
+        f"afade=t=out:st={audio_fade_out_start:.3f}:d={AUDIO_FADE}"
         f"[afinal]"
     )
 

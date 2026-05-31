@@ -806,22 +806,21 @@ async def _run_render_sleep_background(
     failed_chunks: list[int],   # global image indices to substitute
     task_key: str,
 ):
-    """v32 per-chapter sleep render.
+    """Sleep render: concat all chapter WAVs → single compose.py call.
 
-    For each chapter:
-      1. Determine scene_dur_i = duration_sec_i / scene_count_i
-      2. Run compose.py with the chapter's image range (scene_offset) and audio
-      3. Save intermediate to {job_id}/render/chapter_{i}.mp4
+    Rule 1 (audio is master): compose.py uses ffprobe to measure the real
+    audio duration and back-calculates per_image = audio_dur / N so the
+    video is always exactly as long as the audio. No frozen frames, no
+    silent tails.
 
-    After all chapters: concat with ffmpeg -f concat (stream copy, no re-encode).
-    Cinematic effects apply per-chapter so xfade never cuts across chapter boundaries.
-    Intermediate chapter mp4s are retained in the render/ dir for retry resilience.
+    Rule 2 (no chapter gaps): all chapter WAVs are concatenated into one
+    continuous track with ffmpeg concat demuxer (stream-copy, lossless).
+    compose.py sees one unbroken audio file → one unbroken video with
+    smooth xfade transitions throughout, no inter-chapter pauses.
     """
     import shutil
 
     audio_dir = JOBS_DIR / job_id / "audio"
-    render_dir = JOBS_DIR / job_id / "render"
-    render_dir.mkdir(parents=True, exist_ok=True)
     compose_script = _locate_compose_script()
 
     if not compose_script.exists():
@@ -829,85 +828,67 @@ async def _run_render_sleep_background(
         _job_end(job_id)
         return
 
-    failed_set = set(failed_chunks)
-    chapter_mp4s: list[Path] = []
-
     try:
-        for i, chapter in enumerate(chapters, start=1):
-            audio_filename  = audio_files[i - 1] if (i - 1) < len(audio_files) else f"sleep_ch{i}.wav"
-            audio_path      = audio_dir / audio_filename
-            duration_sec    = float(chapter["duration_sec"])
-            scene_count     = int(chapter["scene_count"])
-            scene_offset    = int(chapter["scene_offset"])
-            scene_dur       = duration_sec / scene_count if scene_count > 0 else 8.0
-            chapter_mp4     = render_dir / f"chapter_{i}.mp4"
-
-            if not audio_path.exists():
-                _render_tasks[task_key] = {
-                    "status": "error",
-                    "error": f"Chapter {i} audio not found: {audio_path}",
-                }
-                return
-
-            # Global failed indices that fall inside this chapter's range
-            ch_failed = [
-                idx for idx in failed_set
-                if scene_offset <= idx < scene_offset + scene_count
-            ]
-
-            cmd = [
-                "python3", str(compose_script),
-                "--job-id",       job_id,
-                "--video-type",   "sleep_en",
-                "--scene-count",  str(scene_count),
-                "--scene-dur",    f"{scene_dur:.6f}",
-                "--scene-offset", str(scene_offset),
-                "--audio",        str(audio_path),
-                "--output",       str(chapter_mp4),
-                "--jobs-dir",     str(JOBS_DIR),
-            ]
-            if ch_failed:
-                cmd.extend(["--failed-chunks", ",".join(str(x) for x in ch_failed)])
-
-            print(f"[RENDER] job={job_id} chapter={i}/{len(chapters)} "
-                  f"scenes={scene_offset}..{scene_offset+scene_count-1} "
-                  f"dur={scene_dur:.3f}s failed={len(ch_failed)}")
-
-            loop = asyncio.get_event_loop()
-            # Capture cmd in lambda default to avoid closure-over-loop-variable bug
-            result = await loop.run_in_executor(
-                None, lambda c=cmd: subprocess.run(c, capture_output=True, text=True)
-            )
-            if result.returncode != 0:
-                err = (result.stderr or result.stdout or "")[-1000:]
-                _render_tasks[task_key] = {
-                    "status": "error",
-                    "error": f"compose.py chapter {i} failed: {err}",
-                }
-                return
-
-            chapter_mp4s.append(chapter_mp4)
-
-        # ── Concat all chapter mp4s (stream copy — no re-encode) ──────────
-        output_mp4  = JOBS_DIR / job_id / "sleep_en.mp4"
-        concat_txt  = render_dir / "chapters.txt"
-        concat_txt.write_text(
-            "\n".join(f"file '{p.resolve()}'" for p in chapter_mp4s)
-        )
-
-        concat_cmd = [
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0", "-i", str(concat_txt),
-            "-c", "copy",
-            str(output_mp4),
-        ]
         loop = asyncio.get_event_loop()
+
+        # ── Step 1: verify all chapter audio files exist ──────────────
+        chapter_wavs: list[Path] = []
+        for i, fname in enumerate(audio_files, start=1):
+            wav = audio_dir / fname
+            if not wav.exists():
+                _render_tasks[task_key] = {
+                    "status": "error",
+                    "error": f"Chapter {i} audio not found: {wav}",
+                }
+                return
+            chapter_wavs.append(wav)
+
+        # ── Step 2: concatenate chapter WAVs into one continuous track ─
+        combined_audio = audio_dir / "sleep_combined.wav"
+        concat_list    = audio_dir / "sleep_concat_list.txt"
+        concat_list.write_text(
+            "\n".join(f"file '{w.resolve()}'" for w in chapter_wavs)
+        )
+        concat_audio_cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0", "-i", str(concat_list),
+            "-c", "copy",
+            str(combined_audio),
+        ]
+        print(f"[RENDER] job={job_id} sleep: concatenating {len(chapter_wavs)} chapter WAVs")
         result = await loop.run_in_executor(
-            None, lambda: subprocess.run(concat_cmd, capture_output=True, text=True)
+            None, lambda: subprocess.run(concat_audio_cmd, capture_output=True, text=True)
         )
         if result.returncode != 0:
             err = (result.stderr or result.stdout or "")[-800:]
-            _render_tasks[task_key] = {"status": "error", "error": f"concat failed: {err}"}
+            _render_tasks[task_key] = {"status": "error", "error": f"audio concat failed: {err}"}
+            return
+
+        # ── Step 3: single compose.py call with all images + combined audio
+        total_scene_count = sum(int(c["scene_count"]) for c in chapters)
+        output_mp4        = JOBS_DIR / job_id / "sleep_en.mp4"
+
+        cmd = [
+            "python3", str(compose_script),
+            "--job-id",      job_id,
+            "--video-type",  "sleep_en",
+            "--scene-count", str(total_scene_count),
+            "--scene-dur",   "8.0",        # hint only — overridden by ffprobe inside compose.py
+            "--scene-offset", "0",
+            "--audio",       str(combined_audio),
+            "--output",      str(output_mp4),
+            "--jobs-dir",    str(JOBS_DIR),
+        ]
+        if failed_chunks:
+            cmd.extend(["--failed-chunks", ",".join(str(x) for x in failed_chunks)])
+
+        print(f"[RENDER] job={job_id} sleep: {total_scene_count} scenes, single combined audio")
+        result = await loop.run_in_executor(
+            None, lambda c=cmd: subprocess.run(c, capture_output=True, text=True)
+        )
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "")[-1200:]
+            _render_tasks[task_key] = {"status": "error", "error": f"compose.py failed: {err}"}
             return
 
         volume_out = Path("/workspace/output") / job_id
